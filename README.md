@@ -1,22 +1,26 @@
 # Codex MCP Longrun
 
-Codex MCP Longrun is a local STDIO MCP server that runs one bounded,
-non-interactive command and waits for a terminal result without model-driven
-status polling.
+Codex MCP Longrun is a local STDIO MCP server for bounded, non-interactive
+command jobs. Its default asynchronous workflow returns a job ID promptly so
+current Codex runtimes do not need to keep a blocking tool call alive through
+model-visible wait loops.
 
 It is intended for builds, test suites, packaging jobs, and similar trusted
-foreground commands. The local server performs the wait; Codex makes one tool
-call and receives one final structured result.
+foreground commands. The local server validates the request, supervises the
+process group, captures bounded output, and persists terminal metadata.
 
 ```text
-Codex calls longrun.run_and_wait once
+Codex calls longrun.start_job once
                   |
                   v
 The local MCP server starts the command,
-captures bounded output, and waits locally
+returns a job ID, and supervises it locally
                   |
                   v
-Codex receives one terminal result
+Codex ends the turn without polling
+                  |
+                  v
+Codex calls get_job once later
 ```
 
 The project is currently a Linux/WSL pilot, not a production release.
@@ -25,30 +29,39 @@ The project is currently a Linux/WSL pilot, not a production release.
 
 Repeatedly checking a long build with model-visible polling tools consumes
 context and may require additional model turns even when nothing changed.
-Codex MCP Longrun removes those intermediate polling turns. It does not make
-the initial tool call or the final model response token-free.
+`start_job` avoids keeping the original tool call pending. It does not make the
+initial submission or a later result check token-free, and the MCP server cannot
+wake an idle Codex thread by itself.
 
-While a call remains pending, the server can emit a short MCP progress
-heartbeat. By default, the first heartbeat is sent after five minutes and the
-next ones every 15 minutes. A heartbeat is a transport notification inside the
-same tool call, not another tool call or a log poll. It contains only elapsed
-time, time since the last output, and the number of captured bytes; it never
-contains command output.
+Current Codex clients may turn a blocking MCP call into an outer executor cell
+and ask the model to wait for that cell repeatedly. For this reason,
+`run_and_wait` remains available only as a compatibility tool and is excluded
+from the default Codex tool allowlist.
+
+While a legacy blocking call remains pending, the server can emit a short MCP
+progress heartbeat. Heartbeats are disabled by default because they do not
+prevent an outer Codex executor from yielding. When explicitly enabled, a
+heartbeat contains only elapsed time, time since the last output, and the
+number of captured bytes; it never contains command output.
 
 The MCP and Codex documentation does not define a billing or model-token
-guarantee for progress notifications. The design therefore minimizes their
-frequency and size while keeping the main saving: no model-driven status loop.
+guarantee for progress notifications. Keep them disabled unless a specific
+client has been verified to render progress without re-entering the model.
 
 ## Tools
 
 | Tool | Purpose |
 | --- | --- |
 | `health` | Report the version, state paths, allowed roots, and active guardrails |
-| `run_and_wait` | Run one command and wait for success, failure, timeout, inactivity timeout, or cancellation |
+| `start_job` | Start one command and return a durable local job ID promptly |
+| `get_job` | Read one bounded status or terminal result for a known job ID |
+| `cancel_job` | Request process-group cancellation for one exact job ID |
+| `run_and_wait` | Legacy blocking compatibility mode; disabled by default in Codex |
 | `read_log_tail` | Read a bounded tail for a known job ID |
 
-There is intentionally no asynchronous `start` plus frequently polled
-`status` workflow.
+Do not repeatedly call `get_job` in the same turn. The asynchronous API removes
+the forced blocking wait, but event-driven completion still requires native
+support from the Codex client.
 
 ## Requirements
 
@@ -93,10 +106,12 @@ The configuration script:
 - refuses to overwrite an existing `mcp_servers.longrun` entry;
 - creates a timestamped private backup under `~/.codex/backups`;
 - keeps the MCP optional with `required = false`;
-- allows only the three documented tools;
-- configures `run_and_wait` and `read_log_tail` to require approval;
+- allows only `health`, `start_job`, `get_job`, `cancel_job`, and `read_log_tail`;
+- configures command start, cancellation, and log reads to require approval;
+- keeps bounded metadata-only `get_job` reads automatic;
 - disables shell and privilege-elevation executables;
-- enables a first heartbeat after 300 seconds and repeats it every 900 seconds;
+- disables progress heartbeats by default;
+- limits all live jobs across local Codex sessions to four by default;
 - gives Codex a tool timeout slightly longer than the server's 12-hour limit.
 
 Start a new Codex process after configuration. Existing on-screen processes do
@@ -115,7 +130,7 @@ codex mcp list
 
 ## Enroll additional projects
 
-The global server is visible to new Codex processes, but `run_and_wait` accepts
+The global server is visible to new Codex processes, but command tools accept
 working directories only under exact trusted roots. Add another project with
 the idempotent enrollment command:
 
@@ -139,21 +154,38 @@ Codex agents performing a session or project integration should follow the
 
 ## Usage
 
-Ask Codex to use `longrun.run_and_wait` once for a reviewed command. Pass the
+Ask Codex to use `longrun.start_job` once for a reviewed command. Pass the
 command as an argument array, not as a shell string. For example:
 
 ```text
-Use longrun.run_and_wait once for ["cargo", "test"], with cwd set to this
-project. Wait for the final result and do not poll.
+Use longrun.start_job once for ["cargo", "test"], with cwd set to this
+project. Report the job ID and end the turn without polling. Do not claim that
+Codex will wake automatically.
 ```
 
-The tool supports:
+The job supports:
 
 - a hard timeout;
 - an optional no-output timeout;
 - expected success and failure substrings;
 - a bounded result tail;
 - graceful termination followed by forced process-group cleanup.
+
+Later, request one bounded status read:
+
+```text
+Call longrun.get_job once for JOB_ID. If it is still running, report the state
+and do not poll again in this turn.
+```
+
+Keep the originating interactive Codex process open while the job runs. A
+one-shot `codex exec` client exits after its response and closes its MCP server;
+the supervisor then terminates the command by design. This parent-death rule
+prevents detached work from outliving the client that started it.
+
+When a durable Codex `/goal` has no other useful work, pause the goal before
+waiting and resume it for the agreed result check. The MCP server cannot pause,
+resume, or wake a goal on its own.
 
 ### Progress heartbeats
 
@@ -162,8 +194,9 @@ Heartbeat timing is server-wide and can be changed in the
 
 | Environment variable | Default | Meaning |
 | --- | ---: | --- |
-| `LONGRUN_HEARTBEAT_INITIAL_SEC` | `300` | Delay before the first notification; `0` disables heartbeats |
+| `LONGRUN_HEARTBEAT_INITIAL_SEC` | `0` | Delay before the first notification; `0` disables heartbeats |
 | `LONGRUN_HEARTBEAT_INTERVAL_SEC` | `900` | Interval between later notifications |
+| `LONGRUN_MAX_ACTIVE_JOBS` | `4` | Maximum live jobs across local Codex MCP server processes |
 
 `longrun.health` reports the effective values. The server silently disables
 heartbeats for the current job if notification delivery fails; the command
@@ -216,22 +249,36 @@ Create the development environment and run the integration suite:
 
 ```bash
 uv sync --frozen --no-dev
-.venv/bin/python -m unittest -v tests.test_server tests.test_enroll_project
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
-The suite covers the STDIO handshake, protocol-level progress delivery,
+The suite covers the STDIO handshake, asynchronous submission and later
+terminal reads, cross-session visibility and cancellation, active-job limits,
+protocol-level progress delivery,
 environment isolation, allowed-root and shell rejection, successful and failed
 commands, hard and inactivity timeouts, log truncation, cancellation,
 descendant cleanup, abrupt parent death, metadata recovery, safe config
-enrollment, backup permissions, idempotency, and broad-root rejection.
+enrollment and upgrades, backup permissions, idempotency, broad-root rejection,
+and sanitized session-polling audits.
 
 ## Upgrade and rollback
 
-After pulling a reviewed update, reinstall the isolated runtime:
+After pulling a reviewed update, preview and apply the guarded configuration
+upgrade, then reinstall the isolated runtime:
+
+```bash
+./scripts/upgrade-codex.py --config "$HOME/.codex/config.toml" --dry-run
+./scripts/upgrade-codex.py --config "$HOME/.codex/config.toml"
+```
 
 ```bash
 ./scripts/install-runtime.sh
 ```
+
+The upgrade creates a private timestamped backup, preserves unrelated TOML and
+explicit heartbeat policy, enables the asynchronous tool allowlist, and is
+idempotent. Use `--reset-heartbeat` only when an existing nonzero heartbeat
+should be changed to zero.
 
 To disable the server without deleting local state:
 
@@ -250,5 +297,6 @@ Removing the MCP configuration does not remove either directory automatically.
 
 - [OpenAI Codex MCP documentation](https://developers.openai.com/codex/mcp)
 - [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)
+- [Event-driven wakeup design and acceptance criteria](docs/EVENT_DRIVEN_WAKEUP.md)
 - [Codex issue: background process polling wastes tokens](https://github.com/openai/codex/issues/13733)
 - [Codex issue: event-driven wakeup for background commands](https://github.com/openai/codex/issues/32188)

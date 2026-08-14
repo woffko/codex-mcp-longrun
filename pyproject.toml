@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-mcp-longrun"
-version = "0.2.0"
-description = "Local MCP server that waits for bounded non-interactive commands without model-driven polling"
+version = "0.3.0"
+description = "Local MCP server for bounded asynchronous command jobs with guarded execution"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "woffko" }]

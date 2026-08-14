@@ -54,7 +54,7 @@ enabled = true
 required = false
 startup_timeout_sec = 20
 tool_timeout_sec = 43500
-enabled_tools = ["health", "run_and_wait", "read_log_tail"]
+enabled_tools = ["health", "start_job", "get_job", "cancel_job", "read_log_tail"]
 default_tools_approval_mode = "prompt"
 env_vars = [{forwarded_toml}]
 
@@ -63,8 +63,9 @@ LONGRUN_STATE_DIR = {_toml_string(str(state_dir))}
 LONGRUN_ALLOWED_ROOTS = {_toml_string(str(allowed_root))}
 LONGRUN_MAX_LOG_BYTES = "134217728"
 LONGRUN_MAX_TIMEOUT_SEC = "43200"
-LONGRUN_HEARTBEAT_INITIAL_SEC = "300"
+LONGRUN_HEARTBEAT_INITIAL_SEC = "0"
 LONGRUN_HEARTBEAT_INTERVAL_SEC = "900"
+LONGRUN_MAX_ACTIVE_JOBS = "4"
 LONGRUN_ALLOW_SHELL = "0"
 LONGRUN_FORWARD_ENV_NAMES = {_toml_string(forwarded_csv)}
 
@@ -72,6 +73,15 @@ LONGRUN_FORWARD_ENV_NAMES = {_toml_string(forwarded_csv)}
 approval_mode = "auto"
 
 [mcp_servers.longrun.tools.read_log_tail]
+approval_mode = "prompt"
+
+[mcp_servers.longrun.tools.start_job]
+approval_mode = "prompt"
+
+[mcp_servers.longrun.tools.get_job]
+approval_mode = "auto"
+
+[mcp_servers.longrun.tools.cancel_job]
 approval_mode = "prompt"
 
 [mcp_servers.longrun.tools.run_and_wait]

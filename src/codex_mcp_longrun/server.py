@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import fcntl
 import hashlib
 import json
 import os
@@ -15,7 +16,7 @@ import sys
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version as package_version
@@ -32,14 +33,15 @@ from pydantic import BaseModel, Field
 
 
 SERVER_NAME = "Codex MCP Longrun"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 DEFAULT_MAX_LOG_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_TIMEOUT_SEC = 12 * 60 * 60
-DEFAULT_HEARTBEAT_INITIAL_SEC = 5 * 60
+DEFAULT_HEARTBEAT_INITIAL_SEC = 0
 DEFAULT_HEARTBEAT_INTERVAL_SEC = 15 * 60
+DEFAULT_MAX_ACTIVE_JOBS = 4
 MAX_MEMORY_TAIL_CHARS = 64 * 1024
 MAX_MATCH_TEXT_LENGTH = 4096
-JOB_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+JOB_ID_RE = re.compile(r"^(?:[a-f0-9]{12}|[a-f0-9]{32})$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SECRET_ENV_PARTS = (
     "api_key",
@@ -153,6 +155,7 @@ STATE_DIR = Path(
     os.environ.get("LONGRUN_STATE_DIR", str(Path.home() / ".local" / "state" / "codex-longrun"))
 ).expanduser().resolve()
 JOBS_DIR = STATE_DIR / "jobs"
+JOBS_LOCK_PATH = STATE_DIR / ".jobs.lock"
 MAX_LOG_BYTES = _read_int_env(
     "LONGRUN_MAX_LOG_BYTES",
     DEFAULT_MAX_LOG_BYTES,
@@ -176,6 +179,12 @@ HEARTBEAT_INTERVAL_SEC = _read_int_env(
     DEFAULT_HEARTBEAT_INTERVAL_SEC,
     1,
     24 * 60 * 60,
+)
+MAX_ACTIVE_JOBS = _read_int_env(
+    "LONGRUN_MAX_ACTIVE_JOBS",
+    DEFAULT_MAX_ACTIVE_JOBS,
+    1,
+    64,
 )
 ALLOWED_ROOTS = _load_allowed_roots()
 FORWARD_ENV_NAMES = _load_forward_env_names()
@@ -213,6 +222,18 @@ def _atomic_write_json(path: Path, value: dict[str, object]) -> None:
     _atomic_write_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
+@contextmanager
+def _locked_job_state():
+    _ensure_state_dirs()
+    with JOBS_LOCK_PATH.open("a+b") as lock_file:
+        JOBS_LOCK_PATH.chmod(0o600)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def _proc_start_ticks(pid: int) -> str | None:
     if not sys.platform.startswith("linux"):
         return None
@@ -233,7 +254,7 @@ def _pid_matches(pid: object, start_ticks: object) -> bool:
 SERVER_START_TICKS = _proc_start_ticks(os.getpid())
 
 
-def _recover_orphaned_jobs() -> int:
+def _recover_orphaned_jobs_locked() -> int:
     _ensure_state_dirs()
     recovered = 0
     for metadata_path in JOBS_DIR.glob("*.json"):
@@ -241,7 +262,7 @@ def _recover_orphaned_jobs() -> int:
             payload = json.loads(metadata_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if not isinstance(payload, dict) or payload.get("state") not in {"starting", "running"}:
+        if not isinstance(payload, dict) or payload.get("state") not in {"queued", "starting", "running"}:
             continue
         if _pid_matches(payload.get("server_pid"), payload.get("server_start_ticks")):
             continue
@@ -281,23 +302,30 @@ def _recover_orphaned_jobs() -> int:
     return recovered
 
 
+def _recover_orphaned_jobs() -> int:
+    with _locked_job_state():
+        return _recover_orphaned_jobs_locked()
+
+
 RECOVERED_ORPHAN_JOBS = _recover_orphaned_jobs()
 
 
 MCP_INSTRUCTIONS = (
-    "Use run_and_wait only for a reviewed, trusted, non-interactive command expected to run longer "
-    "than about 30 seconds. One call waits locally until exit, timeout, inactivity timeout, or "
-    "cancellation; do not poll it. Rare progress notifications only confirm that the command is "
-    "still running; they never contain log text. Pass argv as an array and cwd as an absolute path. Never pass "
-    "secrets. Shell and privilege-elevation commands are disabled. Full output stays in a private "
-    "local log and only a bounded tail is returned. This server uses host-user permissions and is "
-    "not a security sandbox."
+    "For a reviewed, trusted, non-interactive command expected to run longer than about 30 seconds, "
+    "use start_job once. It returns promptly with a job_id while the local server supervises the "
+    "command. Do not poll get_job in the same turn and do not claim that Codex will wake automatically; "
+    "automatic_wakeup is false until the Codex client provides event-driven completion. Use get_job "
+    "later for one bounded status read and cancel_job only after approval. run_and_wait is a legacy "
+    "compatibility tool because some Codex runtimes turn a pending tool call into model-driven waits. "
+    "Pass argv as an array and cwd as an absolute path. Never pass secrets. Shell and privilege-elevation "
+    "commands are disabled. Full output stays in a private local log and only a bounded tail is returned. "
+    "This server uses host-user permissions and is not a security sandbox."
 )
 
 mcp = MCPServer(
     "codex-longrun",
     title=SERVER_NAME,
-    description="Waits locally for one bounded non-interactive command without model-driven polling.",
+    description="Runs bounded non-interactive commands with a prompt asynchronous job mode.",
     instructions=MCP_INSTRUCTIONS,
     version=SERVER_VERSION,
     log_level="WARNING",
@@ -315,6 +343,7 @@ class HealthResult(BaseModel):
     allow_shell: bool
     max_log_bytes: int
     max_timeout_sec: int
+    max_active_jobs: int
     heartbeat_initial_sec: int
     heartbeat_interval_sec: int
     recovered_orphan_jobs: int
@@ -327,6 +356,21 @@ RunState = Literal[
     "inactive_timeout",
     "success_condition_not_met",
     "spawn_error",
+    "cancelled",
+]
+
+JobState = Literal[
+    "queued",
+    "starting",
+    "running",
+    "succeeded",
+    "failed",
+    "timed_out",
+    "inactive_timeout",
+    "success_condition_not_met",
+    "spawn_error",
+    "cancelled",
+    "orphaned_recovered",
 ]
 
 
@@ -356,6 +400,36 @@ class LogTailResult(BaseModel):
     tail: str
 
 
+class JobStatusResult(BaseModel):
+    job_id: str
+    state: JobState
+    terminal: bool
+    automatic_wakeup: bool = False
+    recommended_check_after_sec: int | None = None
+    exit_code: int | None = None
+    duration_sec: float
+    started_at_utc: str
+    finished_at_utc: str | None = None
+    command_display: str
+    cwd: str
+    log_path: str
+    metadata_path: str
+    output_bytes_seen: int = 0
+    output_bytes_logged: int = 0
+    log_truncated: bool = False
+    success_match: str | None = None
+    failure_match: str | None = None
+    error: str | None = None
+    tail: str = ""
+
+
+class CancelJobResult(BaseModel):
+    job_id: str
+    state: JobState
+    cancellation_requested: bool
+    terminal: bool
+
+
 @dataclass
 class OutputTracker:
     max_log_bytes: int
@@ -383,6 +457,159 @@ class OutputTracker:
             self.success_match = self.success_contains
         if self.failure_contains and self.failure_match is None and self.failure_contains in self.scan_text:
             self.failure_match = self.failure_contains
+
+
+TERMINAL_JOB_STATES = {
+    "succeeded",
+    "failed",
+    "timed_out",
+    "inactive_timeout",
+    "success_condition_not_met",
+    "spawn_error",
+    "cancelled",
+    "orphaned_recovered",
+}
+_BACKGROUND_JOBS: dict[str, asyncio.Task[RunResult]] = {}
+
+
+def _new_job_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _metadata_path(job_id: str) -> Path:
+    if not JOB_ID_RE.fullmatch(job_id):
+        raise ValueError("invalid job_id")
+    return JOBS_DIR / f"{job_id}.json"
+
+
+def _read_job_metadata(job_id: str) -> dict[str, object]:
+    path = _metadata_path(job_id)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"no job metadata found for {job_id}") from exc
+    if not isinstance(payload, dict) or payload.get("job_id") != job_id:
+        raise ValueError(f"invalid metadata for job {job_id}")
+    cwd = payload.get("cwd")
+    if isinstance(cwd, str):
+        resolved = Path(cwd).expanduser().resolve()
+        if not any(_is_within(resolved, root) for root in ALLOWED_ROOTS):
+            raise PermissionError(f"job {job_id} is outside the currently allowed roots")
+    return payload
+
+
+def _elapsed_from_payload(payload: dict[str, object]) -> float:
+    stored = payload.get("duration_sec")
+    if isinstance(stored, (int, float)):
+        return round(float(stored), 3)
+    started = payload.get("started_at_utc")
+    if isinstance(started, str):
+        try:
+            parsed = datetime.fromisoformat(started)
+            return round(max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds()), 3)
+        except ValueError:
+            pass
+    return 0.0
+
+
+def _job_status_from_payload(
+    payload: dict[str, object],
+    *,
+    tail_lines: int = 80,
+    tail_bytes: int = 16384,
+) -> JobStatusResult:
+    job_id = str(payload["job_id"])
+    state = str(payload.get("state", "spawn_error"))
+    terminal = state in TERMINAL_JOB_STATES
+    tail = ""
+    if terminal and tail_lines > 0:
+        tail_path = JOBS_DIR / f"{job_id}.tail.txt"
+        if tail_path.is_file():
+            text = tail_path.read_text(encoding="utf-8", errors="replace")
+            tail = _limit_tail(text, tail_lines, tail_bytes)
+        elif isinstance(payload.get("tail"), str):
+            tail = _limit_tail(str(payload["tail"]), tail_lines, tail_bytes)
+    return JobStatusResult(
+        job_id=job_id,
+        state=state,  # type: ignore[arg-type]
+        terminal=terminal,
+        automatic_wakeup=False,
+        recommended_check_after_sec=None if terminal else 600,
+        exit_code=payload.get("exit_code") if isinstance(payload.get("exit_code"), int) else None,
+        duration_sec=_elapsed_from_payload(payload),
+        started_at_utc=str(payload.get("started_at_utc", "")),
+        finished_at_utc=(
+            str(payload["finished_at_utc"]) if isinstance(payload.get("finished_at_utc"), str) else None
+        ),
+        command_display=str(payload.get("command_display", "<pending validation>")),
+        cwd=str(payload.get("cwd", "")),
+        log_path=str(payload.get("log_path", JOBS_DIR / f"{job_id}.log")),
+        metadata_path=str(_metadata_path(job_id)),
+        output_bytes_seen=int(payload.get("output_bytes_seen", 0)),
+        output_bytes_logged=int(payload.get("output_bytes_logged", 0)),
+        log_truncated=bool(payload.get("log_truncated", False)),
+        success_match=(str(payload["success_match"]) if payload.get("success_match") is not None else None),
+        failure_match=(str(payload["failure_match"]) if payload.get("failure_match") is not None else None),
+        error=str(payload["error"]) if payload.get("error") is not None else None,
+        tail=tail,
+    )
+
+
+def _active_job_count_locked() -> int:
+    active = 0
+    for path in JOBS_DIR.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict) or payload.get("state") not in {"queued", "starting", "running"}:
+            continue
+        if _pid_matches(payload.get("server_pid"), payload.get("server_start_ticks")):
+            active += 1
+    return active
+
+
+def _reserve_job(job_id: str, cwd: str) -> None:
+    with _locked_job_state():
+        active = _active_job_count_locked()
+        if active >= MAX_ACTIVE_JOBS:
+            raise RuntimeError(f"active job limit reached ({active}/{MAX_ACTIVE_JOBS})")
+        _atomic_write_json(
+            _metadata_path(job_id),
+            {
+                "job_id": job_id,
+                "state": "queued",
+                "started_at_utc": _utc_now(),
+                "server_pid": os.getpid(),
+                "server_start_ticks": SERVER_START_TICKS,
+                "command_display": "<pending validation>",
+                "cwd": cwd,
+                "log_path": str(JOBS_DIR / f"{job_id}.log"),
+            },
+        )
+
+
+def _consume_background_result(job_id: str, task: asyncio.Task[RunResult]) -> None:
+    _BACKGROUND_JOBS.pop(job_id, None)
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        path = JOBS_DIR / f"{job_id}.json"
+        with _locked_job_state():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                payload = {"job_id": job_id, "started_at_utc": _utc_now(), "cwd": ""}
+            payload.update(
+                {
+                    "state": "spawn_error",
+                    "finished_at_utc": _utc_now(),
+                    "error": f"background task error: {type(exc).__name__}: {exc}",
+                }
+            )
+            _atomic_write_json(path, payload)
 
 
 def _mcp_version() -> str:
@@ -691,45 +918,31 @@ async def health() -> HealthResult:
         allow_shell=ALLOW_SHELL,
         max_log_bytes=MAX_LOG_BYTES,
         max_timeout_sec=MAX_TIMEOUT_SEC,
+        max_active_jobs=MAX_ACTIVE_JOBS,
         heartbeat_initial_sec=HEARTBEAT_INITIAL_SEC,
         heartbeat_interval_sec=HEARTBEAT_INTERVAL_SEC,
         recovered_orphan_jobs=RECOVERED_ORPHAN_JOBS,
     )
 
 
-@mcp.tool(
-    title="Run a long command and wait locally",
-    annotations=ToolAnnotations(
-        read_only_hint=False,
-        destructive_hint=True,
-        idempotent_hint=False,
-        open_world_hint=True,
-    ),
-)
-async def run_and_wait(
-    argv: Annotated[
-        list[str],
-        Field(
-            min_length=1,
-            max_length=256,
-            description="Command and arguments as an array. Shell and privilege-elevation commands are disabled.",
-        ),
-    ],
-    cwd: Annotated[str, Field(description="Absolute working directory inside LONGRUN_ALLOWED_ROOTS.")],
-    timeout_sec: Annotated[int, Field(ge=1, le=43200)] = 3600,
-    no_output_timeout_sec: Annotated[int, Field(ge=0, le=43200)] = 0,
-    grace_period_sec: Annotated[int, Field(ge=1, le=120)] = 10,
-    success_contains: Annotated[str | None, Field(max_length=MAX_MATCH_TEXT_LENGTH)] = None,
-    failure_contains: Annotated[str | None, Field(max_length=MAX_MATCH_TEXT_LENGTH)] = None,
-    tail_lines: Annotated[int, Field(ge=0, le=200)] = 80,
-    tail_bytes: Annotated[int, Field(ge=1024, le=65536)] = 16384,
-    ctx: Context | None = None,
+async def _execute_job(
+    job_id: str,
+    argv: list[str],
+    cwd: str,
+    timeout_sec: int,
+    no_output_timeout_sec: int,
+    grace_period_sec: int,
+    success_contains: str | None,
+    failure_contains: str | None,
+    tail_lines: int,
+    tail_bytes: int,
+    ctx: Context | None,
+    ready_event: asyncio.Event | None = None,
 ) -> RunResult:
-    """Run one approved non-interactive process and return one bounded terminal result."""
+    """Execute one validated job and persist a bounded terminal result."""
     _ensure_state_dirs()
     started_at = _utc_now()
     started_monotonic = time.monotonic()
-    job_id = uuid.uuid4().hex[:12]
     log_path = JOBS_DIR / f"{job_id}.log"
     tail_path = JOBS_DIR / f"{job_id}.tail.txt"
     metadata_path = JOBS_DIR / f"{job_id}.json"
@@ -743,7 +956,7 @@ async def run_and_wait(
         failure_contains = _validate_match_text(failure_contains, "failure_contains")
         process_env = _build_process_env(resolved_cwd)
     except Exception as exc:
-        return RunResult(
+        result = RunResult(
             job_id=job_id,
             state="spawn_error",
             exit_code=None,
@@ -759,6 +972,10 @@ async def run_and_wait(
             log_truncated=False,
             error=f"validation error: {exc}",
         )
+        _atomic_write_json(metadata_path, result.model_dump())
+        if ready_event is not None:
+            ready_event.set()
+        return result
 
     command_display = _command_display(validated_argv)
     initial_metadata: dict[str, object] = {
@@ -822,6 +1039,8 @@ async def run_and_wait(
             error=f"spawn error: {type(exc).__name__}: {exc}",
         )
         _atomic_write_json(metadata_path, result.model_dump())
+        if ready_event is not None:
+            ready_event.set()
         return result
 
     if proc.stdout is None:
@@ -845,6 +1064,8 @@ async def run_and_wait(
                     "error": "cancelled while waiting for supervisor startup",
                 },
             )
+            if ready_event is not None:
+                ready_event.set()
         raise
     except Exception as exc:
         await _terminate_process(proc, grace_period_sec)
@@ -865,6 +1086,8 @@ async def run_and_wait(
             error=f"supervisor startup error: {type(exc).__name__}: {exc}",
         )
         _atomic_write_json(metadata_path, result.model_dump())
+        if ready_event is not None:
+            ready_event.set()
         return result
 
     initial_metadata.update(
@@ -877,6 +1100,8 @@ async def run_and_wait(
         }
     )
     _atomic_write_json(metadata_path, initial_metadata)
+    if ready_event is not None:
+        ready_event.set()
     tracker = OutputTracker(
         max_log_bytes=MAX_LOG_BYTES,
         success_contains=success_contains,
@@ -957,46 +1182,237 @@ async def run_and_wait(
             tail=_limit_tail(tracker.tail_text, tail_lines, tail_bytes),
         )
         _atomic_write_json(metadata_path, result.model_dump())
+        if ready_event is not None:
+            ready_event.set()
         return result
 
     _atomic_write_text(tail_path, tracker.tail_text)
-    state = _result_state(stop_reason, exit_code, tracker)
-    result = RunResult(
-        job_id=job_id,
-        state=state,
-        exit_code=exit_code,
-        duration_sec=round(time.monotonic() - started_monotonic, 3),
-        started_at_utc=started_at,
-        finished_at_utc=_utc_now(),
-        command_display=command_display,
-        cwd=str(resolved_cwd),
-        log_path=str(log_path),
-        metadata_path=str(metadata_path),
-        output_bytes_seen=tracker.bytes_seen,
-        output_bytes_logged=tracker.bytes_written,
-        log_truncated=tracker.log_truncated,
-        success_match=tracker.success_match,
-        failure_match=tracker.failure_match,
-        tail=_limit_tail(tracker.tail_text, tail_lines, tail_bytes),
-    )
-    metadata = result.model_dump()
-    metadata.update(
-        {
-            "pid": proc.pid,
-            "process_start_ticks": initial_metadata.get("process_start_ticks"),
-            "command_pgid": initial_metadata.get("command_pgid"),
-            "command_start_ticks": initial_metadata.get("command_start_ticks"),
-            "server_pid": os.getpid(),
-            "server_start_ticks": SERVER_START_TICKS,
-            "argv_sha256": initial_metadata["argv_sha256"],
-            "tail_path": str(tail_path),
-            "forwarded_env_names": initial_metadata["forwarded_env_names"],
-            "heartbeat_reports_completed": tracker.heartbeat_reports_completed,
-            "heartbeat_error": tracker.heartbeat_error,
-        }
-    )
-    _atomic_write_json(metadata_path, metadata)
+    with _locked_job_state():
+        try:
+            current_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            current_metadata = {}
+        cancellation_requested = bool(
+            isinstance(current_metadata, dict) and current_metadata.get("cancel_requested_at_utc")
+        )
+        state: RunState = "cancelled" if cancellation_requested else _result_state(stop_reason, exit_code, tracker)
+        result = RunResult(
+            job_id=job_id,
+            state=state,
+            exit_code=exit_code,
+            duration_sec=round(time.monotonic() - started_monotonic, 3),
+            started_at_utc=started_at,
+            finished_at_utc=_utc_now(),
+            command_display=command_display,
+            cwd=str(resolved_cwd),
+            log_path=str(log_path),
+            metadata_path=str(metadata_path),
+            output_bytes_seen=tracker.bytes_seen,
+            output_bytes_logged=tracker.bytes_written,
+            log_truncated=tracker.log_truncated,
+            success_match=tracker.success_match,
+            failure_match=tracker.failure_match,
+            tail=_limit_tail(tracker.tail_text, tail_lines, tail_bytes),
+        )
+        metadata = result.model_dump()
+        metadata.update(
+            {
+                "pid": proc.pid,
+                "process_start_ticks": initial_metadata.get("process_start_ticks"),
+                "command_pgid": initial_metadata.get("command_pgid"),
+                "command_start_ticks": initial_metadata.get("command_start_ticks"),
+                "server_pid": os.getpid(),
+                "server_start_ticks": SERVER_START_TICKS,
+                "argv_sha256": initial_metadata["argv_sha256"],
+                "tail_path": str(tail_path),
+                "forwarded_env_names": initial_metadata["forwarded_env_names"],
+                "heartbeat_reports_completed": tracker.heartbeat_reports_completed,
+                "heartbeat_error": tracker.heartbeat_error,
+            }
+        )
+        if cancellation_requested and isinstance(current_metadata, dict):
+            metadata["cancel_requested_at_utc"] = current_metadata["cancel_requested_at_utc"]
+        _atomic_write_json(metadata_path, metadata)
     return result
+
+
+@mcp.tool(
+    title="Start a bounded long-running command",
+    annotations=ToolAnnotations(
+        read_only_hint=False,
+        destructive_hint=True,
+        idempotent_hint=False,
+        open_world_hint=True,
+    ),
+)
+async def start_job(
+    argv: Annotated[
+        list[str],
+        Field(
+            min_length=1,
+            max_length=256,
+            description="Command and arguments as an array. Shell and privilege-elevation commands are disabled.",
+        ),
+    ],
+    cwd: Annotated[str, Field(description="Absolute working directory inside LONGRUN_ALLOWED_ROOTS.")],
+    timeout_sec: Annotated[int, Field(ge=1, le=43200)] = 3600,
+    no_output_timeout_sec: Annotated[int, Field(ge=0, le=43200)] = 0,
+    grace_period_sec: Annotated[int, Field(ge=1, le=120)] = 10,
+    success_contains: Annotated[str | None, Field(max_length=MAX_MATCH_TEXT_LENGTH)] = None,
+    failure_contains: Annotated[str | None, Field(max_length=MAX_MATCH_TEXT_LENGTH)] = None,
+    tail_lines: Annotated[int, Field(ge=0, le=200)] = 80,
+    tail_bytes: Annotated[int, Field(ge=1024, le=65536)] = 16384,
+) -> JobStatusResult:
+    """Start one approved job, return promptly, and do not wake Codex automatically."""
+    job_id = _new_job_id()
+    try:
+        resolved_cwd = _resolve_cwd(cwd)
+        _validate_argv(argv, resolved_cwd)
+        if timeout_sec > MAX_TIMEOUT_SEC:
+            raise ValueError(f"timeout_sec exceeds configured maximum {MAX_TIMEOUT_SEC}")
+        _validate_match_text(success_contains, "success_contains")
+        _validate_match_text(failure_contains, "failure_contains")
+    except Exception:
+        resolved_cwd = None
+    if resolved_cwd is not None:
+        _reserve_job(job_id, str(resolved_cwd))
+
+    ready_event = asyncio.Event()
+    task = asyncio.create_task(
+        _execute_job(
+            job_id,
+            argv,
+            cwd,
+            timeout_sec,
+            no_output_timeout_sec,
+            grace_period_sec,
+            success_contains,
+            failure_contains,
+            tail_lines,
+            tail_bytes,
+            None,
+            ready_event,
+        ),
+        name=f"codex-longrun-{job_id}",
+    )
+    _BACKGROUND_JOBS[job_id] = task
+    task.add_done_callback(lambda completed, jid=job_id: _consume_background_result(jid, completed))
+    try:
+        await asyncio.wait_for(ready_event.wait(), timeout=3.0)
+    except asyncio.TimeoutError:
+        pass
+    return _job_status_from_payload(_read_job_metadata(job_id), tail_lines=tail_lines, tail_bytes=tail_bytes)
+
+
+@mcp.tool(
+    title="Get one bounded longrun job status",
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
+)
+async def get_job(
+    job_id: Annotated[str, Field(pattern=r"^(?:[a-f0-9]{12}|[a-f0-9]{32})$")],
+    tail_lines: Annotated[int, Field(ge=0, le=200)] = 80,
+    tail_bytes: Annotated[int, Field(ge=1024, le=65536)] = 16384,
+) -> JobStatusResult:
+    """Read a job once; do not repeatedly poll a running job in the same turn."""
+    return _job_status_from_payload(
+        _read_job_metadata(job_id),
+        tail_lines=tail_lines,
+        tail_bytes=tail_bytes,
+    )
+
+
+@mcp.tool(
+    title="Cancel a running longrun job",
+    annotations=ToolAnnotations(
+        read_only_hint=False,
+        destructive_hint=True,
+        idempotent_hint=True,
+        open_world_hint=False,
+    ),
+)
+async def cancel_job(
+    job_id: Annotated[str, Field(pattern=r"^(?:[a-f0-9]{12}|[a-f0-9]{32})$")],
+) -> CancelJobResult:
+    """Request cancellation of one exact job after approval."""
+    with _locked_job_state():
+        payload = _read_job_metadata(job_id)
+        state = str(payload.get("state", "spawn_error"))
+        if state in TERMINAL_JOB_STATES:
+            return CancelJobResult(
+                job_id=job_id,
+                state=state,  # type: ignore[arg-type]
+                cancellation_requested=False,
+                terminal=True,
+            )
+        payload["cancel_requested_at_utc"] = _utc_now()
+        _atomic_write_json(_metadata_path(job_id), payload)
+
+    task = _BACKGROUND_JOBS.get(job_id)
+    if task is not None:
+        task.cancel()
+    else:
+        supervisor_pid = payload.get("pid")
+        supervisor_ticks = payload.get("process_start_ticks")
+        if _pid_matches(supervisor_pid, supervisor_ticks) and isinstance(supervisor_pid, int):
+            try:
+                os.kill(supervisor_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    return CancelJobResult(
+        job_id=job_id,
+        state=state,  # type: ignore[arg-type]
+        cancellation_requested=True,
+        terminal=False,
+    )
+
+
+@mcp.tool(
+    title="Run a long command and wait locally (legacy compatibility)",
+    annotations=ToolAnnotations(
+        read_only_hint=False,
+        destructive_hint=True,
+        idempotent_hint=False,
+        open_world_hint=True,
+    ),
+)
+async def run_and_wait(
+    argv: Annotated[
+        list[str],
+        Field(
+            min_length=1,
+            max_length=256,
+            description="Legacy blocking mode. Prefer start_job in Codex.",
+        ),
+    ],
+    cwd: Annotated[str, Field(description="Absolute working directory inside LONGRUN_ALLOWED_ROOTS.")],
+    timeout_sec: Annotated[int, Field(ge=1, le=43200)] = 3600,
+    no_output_timeout_sec: Annotated[int, Field(ge=0, le=43200)] = 0,
+    grace_period_sec: Annotated[int, Field(ge=1, le=120)] = 10,
+    success_contains: Annotated[str | None, Field(max_length=MAX_MATCH_TEXT_LENGTH)] = None,
+    failure_contains: Annotated[str | None, Field(max_length=MAX_MATCH_TEXT_LENGTH)] = None,
+    tail_lines: Annotated[int, Field(ge=0, le=200)] = 80,
+    tail_bytes: Annotated[int, Field(ge=1024, le=65536)] = 16384,
+    ctx: Context | None = None,
+) -> RunResult:
+    """Legacy blocking mode for clients that can await tools without model-driven polling."""
+    job_id = _new_job_id()
+    try:
+        _reserve_job(job_id, str(_resolve_cwd(cwd)))
+    except ValueError:
+        pass
+    return await _execute_job(
+        job_id,
+        argv,
+        cwd,
+        timeout_sec,
+        no_output_timeout_sec,
+        grace_period_sec,
+        success_contains,
+        failure_contains,
+        tail_lines,
+        tail_bytes,
+        ctx,
+    )
 
 
 @mcp.tool(
@@ -1004,7 +1420,7 @@ async def run_and_wait(
     annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
 )
 async def read_log_tail(
-    job_id: Annotated[str, Field(pattern=r"^[a-f0-9]{12}$")],
+    job_id: Annotated[str, Field(pattern=r"^(?:[a-f0-9]{12}|[a-f0-9]{32})$")],
     tail_lines: Annotated[int, Field(ge=1, le=200)] = 80,
     tail_bytes: Annotated[int, Field(ge=1024, le=65536)] = 16384,
 ) -> LogTailResult:
@@ -1012,6 +1428,7 @@ async def read_log_tail(
     _ensure_state_dirs()
     if not JOB_ID_RE.fullmatch(job_id):
         raise ValueError("invalid job_id")
+    _read_job_metadata(job_id)
     tail_path = JOBS_DIR / f"{job_id}.tail.txt"
     log_path = JOBS_DIR / f"{job_id}.log"
     source = tail_path if tail_path.is_file() else log_path
