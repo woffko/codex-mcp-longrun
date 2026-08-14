@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-mcp-longrun"
+version = "0.1.0"
+description = "Local MCP server that waits for bounded non-interactive commands without model-driven polling"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "woffko" }]
+dependencies = ["mcp==2.0.0"]
+
+[project.urls]
+Homepage = "https://github.com/woffko/codex-mcp-longrun"
+Repository = "https://github.com/woffko/codex-mcp-longrun"
+
+[project.scripts]
+codex-mcp-longrun = "codex_mcp_longrun.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

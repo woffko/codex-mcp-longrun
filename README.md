@@ -1,145 +1,202 @@
 # Codex MCP Longrun
 
-> [!WARNING]
-> This repository is currently a design draft. It does not yet contain an
-> installable MCP server. The security and process-lifecycle work described
-> below must be completed before the first release.
-
-Codex MCP Longrun is a planned local STDIO MCP server for running one bounded,
-non-interactive command and waiting for it to finish without model-driven
+Codex MCP Longrun is a local STDIO MCP server that runs one bounded,
+non-interactive command and waits for a terminal result without model-driven
 status polling.
 
-## Why this project exists
-
-Long builds and test suites can outlive the initial terminal tool call. When an
-agent repeatedly checks a background process with `write_stdin`, every check
-can require another model turn even when nothing has changed. This adds context
-traffic, consumes tokens, and may cause an otherwise healthy job to be treated
-as stalled.
-
-The proposed server moves process waiting into a deterministic local Python
-process:
+It is intended for builds, test suites, packaging jobs, and similar trusted
+foreground commands. The local server performs the wait; Codex makes one tool
+call and receives one final structured result.
 
 ```text
 Codex calls longrun.run_and_wait once
                   |
                   v
 The local MCP server starts the command,
-captures output, and waits for a terminal state
+captures bounded output, and waits locally
                   |
                   v
-Codex receives one bounded final result
+Codex receives one terminal result
 ```
 
-The local wait loop does not call a model. A command still requires an initial
-tool call and a final model step after completion; the goal is to remove
-intermediate polling turns, not to make command execution entirely token-free.
+The project is currently a Linux/WSL pilot, not a production release.
 
-## Intended tools
+## Why use it
+
+Repeatedly checking a long build with model-visible polling tools consumes
+context and may require additional model turns even when nothing changed.
+Codex MCP Longrun removes those intermediate polling turns. It does not make
+the initial tool call or the final model response token-free.
+
+## Tools
 
 | Tool | Purpose |
 | --- | --- |
-| `longrun.health` | Report server version, paths, limits, and active guardrails |
-| `longrun.run_and_wait` | Run one approved non-interactive command and wait locally for completion, timeout, inactivity timeout, or cancellation |
-| `longrun.read_log_tail` | Read a bounded tail for a known completed job without returning the full log to the model |
+| `health` | Report the version, state paths, allowed roots, and active guardrails |
+| `run_and_wait` | Run one command and wait for success, failure, timeout, inactivity timeout, or cancellation |
+| `read_log_tail` | Read a bounded tail for a known job ID |
 
-The server intentionally does not expose a `start` plus frequently polled
-`status` workflow. Full command output is intended to stay in a private local
-log, while the MCP result returns only structured status and a bounded tail.
+There is intentionally no asynchronous `start` plus frequently polled
+`status` workflow.
 
-## Intended use cases
+## Requirements
 
-- Rust, C/C++, Flutter, Android, and OpenWrt builds;
-- long test suites and static-analysis runs;
-- bounded packaging and artifact-generation commands;
-- other trusted foreground commands that require no input after launch.
+- Linux or WSL;
+- [Codex CLI](https://developers.openai.com/codex/cli);
+- [`uv`](https://docs.astral.sh/uv/);
+- a trusted project directory for `LONGRUN_ALLOWED_ROOTS`.
 
-The server is not intended for:
+The dependency lock currently installs Python MCP SDK `2.0.0` in an isolated
+virtual environment.
 
-- interactive programs, REPLs, TUI applications, or password prompts;
-- `sudo` commands that may request terminal input;
-- indefinite servers, daemons, or detached processes;
-- untrusted repositories or unreviewed commands;
-- commands that print or accept credentials.
+## Install from scratch
+
+Clone the repository and install the locked runtime:
+
+```bash
+git clone https://github.com/woffko/codex-mcp-longrun.git
+cd codex-mcp-longrun
+./scripts/install-runtime.sh
+```
+
+The default runtime location is:
+
+```text
+~/.local/share/codex-longrun-mcp/.venv
+```
+
+Register the server in Codex and replace `/absolute/path/to/project` with one
+trusted project root:
+
+```bash
+./scripts/configure-codex.py \
+  --config "$HOME/.codex/config.toml" \
+  --command "$HOME/.local/share/codex-longrun-mcp/.venv/bin/codex-mcp-longrun" \
+  --server-cwd "$HOME/.local/share/codex-longrun-mcp" \
+  --state-dir "$HOME/.local/state/codex-longrun" \
+  --allowed-root /absolute/path/to/project
+```
+
+The configuration script:
+
+- refuses to overwrite an existing `mcp_servers.longrun` entry;
+- creates a timestamped private backup under `~/.codex/backups`;
+- keeps the MCP optional with `required = false`;
+- allows only the three documented tools;
+- configures `run_and_wait` and `read_log_tail` to require approval;
+- disables shell and privilege-elevation executables;
+- gives Codex a tool timeout slightly longer than the server's 12-hour limit.
+
+Start a new Codex process after configuration. Existing on-screen processes do
+not hot-load new MCP servers. A saved session can be resumed in a new process:
+
+```bash
+codex resume -C /absolute/path/to/project SESSION_ID
+```
+
+Verify registration:
+
+```bash
+codex mcp get longrun
+codex mcp list
+```
+
+## Usage
+
+Ask Codex to use `longrun.run_and_wait` once for a reviewed command. Pass the
+command as an argument array, not as a shell string. For example:
+
+```text
+Use longrun.run_and_wait once for ["cargo", "test"], with cwd set to this
+project. Wait for the final result and do not poll.
+```
+
+The tool supports:
+
+- a hard timeout;
+- an optional no-output timeout;
+- expected success and failure substrings;
+- a bounded result tail;
+- graceful termination followed by forced process-group cleanup.
+
+Job logs and metadata are private local files under:
+
+```text
+~/.local/state/codex-longrun/jobs
+```
+
+Logs are capped at 128 MiB by the default installer configuration. The result
+returns only a bounded tail and the local paths.
 
 ## Security boundary
 
-This MCP server will run commands with the permissions of the operating-system
-account that runs Codex. It is not an extension of the Codex shell sandbox and
-does not create a security sandbox of its own.
+This server runs commands with the operating-system permissions of the account
+running Codex. It is not a security sandbox.
 
-A configured allowed-root list can restrict the accepted working directory,
-but it cannot prevent a launched command from accessing other files, networks,
-or processes available to the same user. It is an accidental-misrouting guard,
-not an authorization boundary.
+`LONGRUN_ALLOWED_ROOTS` validates the resolved working directory, but a launched
+program can still access any files, networks, and processes available to the
+same user. Treat the allowed-root check as a routing guard, not an authorization
+boundary.
 
-The first release must enforce all of the following:
+Additional safeguards include:
 
-- `longrun.run_and_wait` always requires an explicit Codex approval prompt;
-- the server starts only commands from trusted workspaces;
-- child processes receive a minimal allowlisted environment rather than a copy
-  of the complete Codex environment;
-- secrets are rejected from tool arguments and are never intentionally written
-  to metadata;
-- logs and metadata use private filesystem permissions and bounded sizes;
-- cancellation, timeout, MCP shutdown, and abrupt parent-process failure cannot
-  leave an unmanaged process tree running;
-- the initial Codex configuration keeps the server optional with
-  `required = false`.
+- shell and privilege-elevation executable rejection by default;
+- no tool parameter for injecting environment variables;
+- a small allowlist of inherited environment names;
+- no raw argument array in job metadata, only a redacted display and digest;
+- private state directories and files;
+- bounded logs and result tails;
+- a Linux supervisor that terminates the full command process group on normal
+  completion, timeout, cancellation, or abrupt MCP-parent death;
+- startup recovery for incomplete metadata left by an interrupted server.
 
-## Planned architecture
+Never pass passwords, tokens, API keys, private keys, cookies, or other secrets
+in arguments. Do not run commands that print secrets: command output is written
+to the local job log. Redaction is best-effort metadata hygiene, not a secret
+detection guarantee.
 
-The initial target is Codex CLI on Linux and WSL:
+Do not use the server for interactive programs, REPLs, TUI applications,
+password prompts, indefinite servers, daemons, detached jobs, untrusted
+repositories, or unreviewed commands.
 
-- transport: local STDIO MCP;
-- implementation: Python 3.10+ with the MCP Python SDK 2.x;
-- installation: isolated virtual environment under the user's local data
-  directory;
-- state: private job metadata and bounded logs under the user's local state
-  directory;
-- registration: a standalone user-level `[mcp_servers.longrun]` entry in Codex
-  `config.toml`;
-- configuration: explicit tool allowlist, per-tool approvals, startup timeout,
-  and a tool timeout longer than the server's maximum internal command timeout.
+## Test
 
-The server will remain separate from project-memory and language-server MCPs.
-Those systems may reference a returned log path, but command execution should
-remain independently auditable and independently disableable.
+Create the development environment and run the integration suite:
 
-## Release gates
+```bash
+uv sync --frozen --no-dev
+.venv/bin/python -m unittest -v tests.test_server
+```
 
-Before installation instructions are published, the implementation must pass:
+The suite covers the STDIO handshake, environment isolation, allowed-root and
+shell rejection, successful and failed commands, hard and inactivity timeouts,
+log truncation, cancellation, descendant cleanup, abrupt parent death, and
+metadata recovery.
 
-1. Python compilation and dependency integrity checks.
-2. In-memory MCP registration and structured-output tests.
-3. Successful completion, non-zero exit, hard-timeout, and inactivity-timeout
-   tests.
-4. Cancellation and process-tree termination tests.
-5. Abrupt MCP-parent termination and orphan-recovery tests.
-6. Allowed-root and symlink-resolution tests.
-7. Environment isolation and secret-sentinel tests.
-8. Log-size, Unicode, truncation, and concurrent-job tests.
-9. Codex configuration parsing and MCP registration checks.
-10. A real acceptance run lasting longer than one minute with exactly one
-    `run_and_wait` call and no model-driven status polling.
+## Upgrade and rollback
 
-## Current status
+After pulling a reviewed update, reinstall the isolated runtime:
 
-- [x] Problem and high-level MCP workflow defined.
-- [x] Codex STDIO MCP configuration and MCP Python SDK v2 feasibility reviewed.
-- [ ] Hardened server implementation.
-- [ ] Automated tests.
-- [ ] Safe installer and rollback workflow.
-- [ ] Linux/WSL acceptance testing.
-- [ ] First release.
+```bash
+./scripts/install-runtime.sh
+```
 
-Installation is intentionally not documented yet. Do not treat the current
-repository as production-ready until the release gates above are complete.
+To disable the server without deleting local state:
 
-## Background
+```bash
+codex mcp remove longrun
+```
+
+Alternatively, restore the timestamped `config.toml.before-longrun-*` backup
+created under `~/.codex/backups`. Start a new Codex process after changing the
+configuration.
+
+The runtime and state directories are independent of the project repository.
+Removing the MCP configuration does not remove either directory automatically.
+
+## References
 
 - [OpenAI Codex MCP documentation](https://developers.openai.com/codex/mcp)
 - [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)
 - [Codex issue: background process polling wastes tokens](https://github.com/openai/codex/issues/13733)
 - [Codex issue: event-driven wakeup for background commands](https://github.com/openai/codex/issues/32188)
-
