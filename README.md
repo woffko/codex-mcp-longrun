@@ -113,6 +113,30 @@ codex mcp get longrun
 codex mcp list
 ```
 
+## Enroll additional projects
+
+The global server is visible to new Codex processes, but `run_and_wait` accepts
+working directories only under exact trusted roots. Add another project with
+the idempotent enrollment command:
+
+```bash
+./scripts/enroll-project.py \
+  --config "$HOME/.codex/config.toml" \
+  --allowed-root /absolute/path/to/another-project \
+  --dry-run
+
+./scripts/enroll-project.py \
+  --config "$HOME/.codex/config.toml" \
+  --allowed-root /absolute/path/to/another-project
+```
+
+The script creates a private backup, preserves unrelated TOML data, validates
+the complete update, and refuses `/` or the current user's home directory.
+Start a new Codex process after enrollment.
+
+Codex agents performing a session or project integration should follow the
+[Codex Agent Integration Runbook](docs/CODEX_AGENT_INTEGRATION.md).
+
 ## Usage
 
 Ask Codex to use `longrun.run_and_wait` once for a reviewed command. Pass the
@@ -192,13 +216,14 @@ Create the development environment and run the integration suite:
 
 ```bash
 uv sync --frozen --no-dev
-.venv/bin/python -m unittest -v tests.test_server
+.venv/bin/python -m unittest -v tests.test_server tests.test_enroll_project
 ```
 
 The suite covers the STDIO handshake, protocol-level progress delivery,
 environment isolation, allowed-root and shell rejection, successful and failed
 commands, hard and inactivity timeouts, log truncation, cancellation,
-descendant cleanup, abrupt parent death, and metadata recovery.
+descendant cleanup, abrupt parent death, metadata recovery, safe config
+enrollment, backup permissions, idempotency, and broad-root rejection.
 
 ## Upgrade and rollback
 
