@@ -14,8 +14,9 @@ import signal
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
@@ -23,6 +24,7 @@ from typing import Annotated, Literal
 
 import anyio
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
 from mcp.shared.message import SessionMessage
 from mcp import types as mcp_types
 from mcp.types import ToolAnnotations
@@ -30,9 +32,11 @@ from pydantic import BaseModel, Field
 
 
 SERVER_NAME = "Codex MCP Longrun"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 DEFAULT_MAX_LOG_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_TIMEOUT_SEC = 12 * 60 * 60
+DEFAULT_HEARTBEAT_INITIAL_SEC = 5 * 60
+DEFAULT_HEARTBEAT_INTERVAL_SEC = 15 * 60
 MAX_MEMORY_TAIL_CHARS = 64 * 1024
 MAX_MATCH_TEXT_LENGTH = 4096
 JOB_ID_RE = re.compile(r"^[a-f0-9]{12}$")
@@ -161,6 +165,18 @@ MAX_TIMEOUT_SEC = _read_int_env(
     60,
     7 * 24 * 60 * 60,
 )
+HEARTBEAT_INITIAL_SEC = _read_int_env(
+    "LONGRUN_HEARTBEAT_INITIAL_SEC",
+    DEFAULT_HEARTBEAT_INITIAL_SEC,
+    0,
+    24 * 60 * 60,
+)
+HEARTBEAT_INTERVAL_SEC = _read_int_env(
+    "LONGRUN_HEARTBEAT_INTERVAL_SEC",
+    DEFAULT_HEARTBEAT_INTERVAL_SEC,
+    1,
+    24 * 60 * 60,
+)
 ALLOWED_ROOTS = _load_allowed_roots()
 FORWARD_ENV_NAMES = _load_forward_env_names()
 ALLOW_SHELL = _read_bool_env("LONGRUN_ALLOW_SHELL", False)
@@ -271,7 +287,8 @@ RECOVERED_ORPHAN_JOBS = _recover_orphaned_jobs()
 MCP_INSTRUCTIONS = (
     "Use run_and_wait only for a reviewed, trusted, non-interactive command expected to run longer "
     "than about 30 seconds. One call waits locally until exit, timeout, inactivity timeout, or "
-    "cancellation; do not poll it. Pass argv as an array and cwd as an absolute path. Never pass "
+    "cancellation; do not poll it. Rare progress notifications only confirm that the command is "
+    "still running; they never contain log text. Pass argv as an array and cwd as an absolute path. Never pass "
     "secrets. Shell and privilege-elevation commands are disabled. Full output stays in a private "
     "local log and only a bounded tail is returned. This server uses host-user permissions and is "
     "not a security sandbox."
@@ -298,6 +315,8 @@ class HealthResult(BaseModel):
     allow_shell: bool
     max_log_bytes: int
     max_timeout_sec: int
+    heartbeat_initial_sec: int
+    heartbeat_interval_sec: int
     recovered_orphan_jobs: int
 
 
@@ -350,6 +369,8 @@ class OutputTracker:
     scan_text: str = ""
     success_match: str | None = None
     failure_match: str | None = None
+    heartbeat_reports_completed: int = 0
+    heartbeat_error: str | None = None
 
     def feed_text(self, text: str, raw_byte_count: int) -> None:
         self.last_output_at = time.monotonic()
@@ -571,19 +592,69 @@ async def _wait_with_limits(
     started_monotonic: float,
     timeout_sec: int,
     no_output_timeout_sec: int,
+    progress_reporter: Callable[[float, str], Awaitable[None]] | None = None,
 ) -> Literal["timed_out", "inactive_timeout"] | None:
     deadline = started_monotonic + timeout_sec
+    next_heartbeat = (
+        started_monotonic + HEARTBEAT_INITIAL_SEC
+        if progress_reporter is not None and HEARTBEAT_INITIAL_SEC > 0
+        else None
+    )
     while proc.returncode is None:
         now = time.monotonic()
         if now >= deadline:
             return "timed_out"
         if no_output_timeout_sec > 0 and now - tracker.last_output_at >= no_output_timeout_sec:
             return "inactive_timeout"
+        if next_heartbeat is not None and now >= next_heartbeat:
+            elapsed = max(0.0, now - started_monotonic)
+            if tracker.bytes_seen > 0:
+                output_status = f"last output {_format_duration(now - tracker.last_output_at)} ago"
+            else:
+                output_status = "no output yet"
+            message = (
+                f"Still running: {_format_duration(elapsed)} elapsed; {output_status}; "
+                f"{_format_bytes(tracker.bytes_seen)} captured."
+            )
+            try:
+                await asyncio.wait_for(progress_reporter(elapsed, message), timeout=2.0)
+                tracker.heartbeat_reports_completed += 1
+                next_heartbeat += HEARTBEAT_INTERVAL_SEC
+                while next_heartbeat <= time.monotonic():
+                    next_heartbeat += HEARTBEAT_INTERVAL_SEC
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                tracker.heartbeat_error = type(exc).__name__
+                next_heartbeat = None
+            continue
         next_deadline = deadline
         if no_output_timeout_sec > 0:
             next_deadline = min(next_deadline, tracker.last_output_at + no_output_timeout_sec)
+        if next_heartbeat is not None:
+            next_deadline = min(next_deadline, next_heartbeat)
         await asyncio.sleep(max(0.05, min(1.0, next_deadline - now)))
     return None
+
+
+def _format_duration(seconds: float) -> str:
+    whole_seconds = max(0, int(seconds))
+    hours, remainder = divmod(whole_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _format_bytes(byte_count: int) -> str:
+    value = float(max(0, byte_count))
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024 or unit == "GiB":
+            return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    raise AssertionError("unreachable")
 
 
 def _result_state(
@@ -620,6 +691,8 @@ async def health() -> HealthResult:
         allow_shell=ALLOW_SHELL,
         max_log_bytes=MAX_LOG_BYTES,
         max_timeout_sec=MAX_TIMEOUT_SEC,
+        heartbeat_initial_sec=HEARTBEAT_INITIAL_SEC,
+        heartbeat_interval_sec=HEARTBEAT_INTERVAL_SEC,
         recovered_orphan_jobs=RECOVERED_ORPHAN_JOBS,
     )
 
@@ -650,6 +723,7 @@ async def run_and_wait(
     failure_contains: Annotated[str | None, Field(max_length=MAX_MATCH_TEXT_LENGTH)] = None,
     tail_lines: Annotated[int, Field(ge=0, le=200)] = 80,
     tail_bytes: Annotated[int, Field(ge=1024, le=65536)] = 16384,
+    ctx: Context | None = None,
 ) -> RunResult:
     """Run one approved non-interactive process and return one bounded terminal result."""
     _ensure_state_dirs()
@@ -699,6 +773,8 @@ async def run_and_wait(
         "log_path": str(log_path),
         "timeout_sec": timeout_sec,
         "no_output_timeout_sec": no_output_timeout_sec,
+        "heartbeat_initial_sec": HEARTBEAT_INITIAL_SEC,
+        "heartbeat_interval_sec": HEARTBEAT_INTERVAL_SEC,
         "forwarded_env_names": [name for name in FORWARD_ENV_NAMES if name in process_env],
     }
     _atomic_write_json(metadata_path, initial_metadata)
@@ -810,6 +886,10 @@ async def run_and_wait(
     reader_task = asyncio.create_task(_drain_output(proc.stdout, log_path, tracker))
     stop_reason: Literal["timed_out", "inactive_timeout"] | None = None
 
+    async def report_progress(progress: float, message: str) -> None:
+        if ctx is not None:
+            await ctx.report_progress(progress=progress, total=None, message=message)
+
     try:
         stop_reason = await _wait_with_limits(
             proc,
@@ -817,6 +897,7 @@ async def run_and_wait(
             started_monotonic,
             timeout_sec,
             no_output_timeout_sec,
+            report_progress if ctx is not None else None,
         )
         if stop_reason is not None:
             await _terminate_process(proc, grace_period_sec)
@@ -841,6 +922,8 @@ async def run_and_wait(
                     "output_bytes_seen": tracker.bytes_seen,
                     "output_bytes_logged": tracker.bytes_written,
                     "log_truncated": tracker.log_truncated,
+                    "heartbeat_reports_completed": tracker.heartbeat_reports_completed,
+                    "heartbeat_error": tracker.heartbeat_error,
                     "tail_path": str(tail_path),
                 },
             )
@@ -908,6 +991,8 @@ async def run_and_wait(
             "argv_sha256": initial_metadata["argv_sha256"],
             "tail_path": str(tail_path),
             "forwarded_env_names": initial_metadata["forwarded_env_names"],
+            "heartbeat_reports_completed": tracker.heartbeat_reports_completed,
+            "heartbeat_error": tracker.heartbeat_error,
         }
     )
     _atomic_write_json(metadata_path, metadata)

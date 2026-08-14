@@ -28,6 +28,17 @@ context and may require additional model turns even when nothing changed.
 Codex MCP Longrun removes those intermediate polling turns. It does not make
 the initial tool call or the final model response token-free.
 
+While a call remains pending, the server can emit a short MCP progress
+heartbeat. By default, the first heartbeat is sent after five minutes and the
+next ones every 15 minutes. A heartbeat is a transport notification inside the
+same tool call, not another tool call or a log poll. It contains only elapsed
+time, time since the last output, and the number of captured bytes; it never
+contains command output.
+
+The MCP and Codex documentation does not define a billing or model-token
+guarantee for progress notifications. The design therefore minimizes their
+frequency and size while keeping the main saving: no model-driven status loop.
+
 ## Tools
 
 | Tool | Purpose |
@@ -85,6 +96,7 @@ The configuration script:
 - allows only the three documented tools;
 - configures `run_and_wait` and `read_log_tail` to require approval;
 - disables shell and privilege-elevation executables;
+- enables a first heartbeat after 300 seconds and repeats it every 900 seconds;
 - gives Codex a tool timeout slightly longer than the server's 12-hour limit.
 
 Start a new Codex process after configuration. Existing on-screen processes do
@@ -118,6 +130,21 @@ The tool supports:
 - expected success and failure substrings;
 - a bounded result tail;
 - graceful termination followed by forced process-group cleanup.
+
+### Progress heartbeats
+
+Heartbeat timing is server-wide and can be changed in the
+`[mcp_servers.longrun.env]` section of the Codex configuration:
+
+| Environment variable | Default | Meaning |
+| --- | ---: | --- |
+| `LONGRUN_HEARTBEAT_INITIAL_SEC` | `300` | Delay before the first notification; `0` disables heartbeats |
+| `LONGRUN_HEARTBEAT_INTERVAL_SEC` | `900` | Interval between later notifications |
+
+`longrun.health` reports the effective values. The server silently disables
+heartbeats for the current job if notification delivery fails; the command
+continues running and still returns its terminal result. Clients that do not
+request progress simply receive no heartbeat.
 
 Job logs and metadata are private local files under:
 
@@ -168,10 +195,10 @@ uv sync --frozen --no-dev
 .venv/bin/python -m unittest -v tests.test_server
 ```
 
-The suite covers the STDIO handshake, environment isolation, allowed-root and
-shell rejection, successful and failed commands, hard and inactivity timeouts,
-log truncation, cancellation, descendant cleanup, abrupt parent death, and
-metadata recovery.
+The suite covers the STDIO handshake, protocol-level progress delivery,
+environment isolation, allowed-root and shell rejection, successful and failed
+commands, hard and inactivity timeouts, log truncation, cancellation,
+descendant cleanup, abrupt parent death, and metadata recovery.
 
 ## Upgrade and rollback
 

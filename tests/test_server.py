@@ -20,6 +20,8 @@ os.environ["LONGRUN_STATE_DIR"] = str(TEST_STATE)
 os.environ["LONGRUN_MAX_LOG_BYTES"] = str(1024 * 1024)
 os.environ["LONGRUN_MAX_TIMEOUT_SEC"] = "60"
 os.environ["LONGRUN_ALLOW_SHELL"] = "0"
+os.environ["LONGRUN_HEARTBEAT_INITIAL_SEC"] = "1"
+os.environ["LONGRUN_HEARTBEAT_INTERVAL_SEC"] = "2"
 os.environ["OPENAI_API_KEY"] = "must-not-reach-child"
 
 from codex_mcp_longrun import server  # noqa: E402
@@ -61,8 +63,78 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(initialized.server_info.name, "codex-longrun")
         self.assertEqual([tool.name for tool in tools.tools], ["health", "run_and_wait", "read_log_tail"])
+        run_tool = next(tool for tool in tools.tools if tool.name == "run_and_wait")
+        self.assertNotIn("ctx", run_tool.input_schema.get("properties", {}))
         self.assertFalse(health.is_error)
         self.assertTrue(health.structured_content["ok"])
+        self.assertEqual(health.structured_content["heartbeat_initial_sec"], 1)
+        self.assertEqual(health.structured_content["heartbeat_interval_sec"], 2)
+
+    async def test_01b_progress_heartbeats(self) -> None:
+        progress_events: list[tuple[float, float | None, str | None]] = []
+
+        async def record_progress(progress: float, total: float | None, message: str | None) -> None:
+            progress_events.append((progress, total, message))
+
+        params = StdioServerParameters(
+            command=str(TEST_ROOT / ".venv" / "bin" / "codex-mcp-longrun"),
+            env=dict(os.environ),
+            cwd=TEST_ROOT,
+        )
+        async with stdio_client(params) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                result = await session.call_tool(
+                    "run_and_wait",
+                    {
+                        "argv": [
+                            sys.executable,
+                            "-c",
+                            "import time; print('private-log-marker', flush=True); time.sleep(3.3)",
+                        ],
+                        "cwd": str(TEST_ROOT),
+                        "timeout_sec": 8,
+                    },
+                    read_timeout_seconds=10,
+                    progress_callback=record_progress,
+                )
+
+        self.assertFalse(result.is_error)
+        self.assertEqual(result.structured_content["state"], "succeeded")
+        self.assertGreaterEqual(len(progress_events), 2)
+        self.assertTrue(all(total is None for _, total, _ in progress_events))
+        self.assertTrue(all(message and message.startswith("Still running:") for _, _, message in progress_events))
+        self.assertTrue(all("private-log-marker" not in (message or "") for _, _, message in progress_events))
+        metadata = json.loads(Path(result.structured_content["metadata_path"]).read_text(encoding="utf-8"))
+        self.assertGreaterEqual(metadata["heartbeat_reports_completed"], 2)
+        self.assertIsNone(metadata["heartbeat_error"])
+
+    async def test_01c_progress_failure_does_not_fail_command(self) -> None:
+        class FailingContext:
+            calls = 0
+
+            async def report_progress(
+                self,
+                progress: float,
+                total: float | None = None,
+                message: str | None = None,
+            ) -> None:
+                self.calls += 1
+                raise RuntimeError("client rejected progress")
+
+        context = FailingContext()
+        result = await server.run_and_wait(
+            argv=[sys.executable, "-c", "import time; time.sleep(1.3)"],
+            cwd=str(TEST_ROOT),
+            timeout_sec=5,
+            ctx=context,  # type: ignore[arg-type]
+        )
+
+        self.assertEqual(result.state, "succeeded")
+        self.assertEqual(context.calls, 1)
+        metadata = json.loads(Path(result.metadata_path).read_text(encoding="utf-8"))
+        self.assertEqual(metadata["heartbeat_reports_completed"], 0)
+        self.assertEqual(metadata["heartbeat_error"], "RuntimeError")
 
     async def test_02_success_tail_and_environment_filter(self) -> None:
         code = (
