@@ -64,6 +64,15 @@ cd codex-mcp-longrun
 `configure-codex.py` refuses to overwrite an existing `mcp_servers.longrun`
 entry. Use the enrollment command below for every additional project.
 
+For an existing installation, preview and apply the guarded asynchronous-tool
+upgrade before reinstalling the runtime:
+
+```bash
+./scripts/upgrade-codex.py --config "$HOME/.codex/config.toml" --dry-run
+./scripts/upgrade-codex.py --config "$HOME/.codex/config.toml"
+./scripts/install-runtime.sh
+```
+
 ## 3. Enroll another exact project root
 
 Preview the update first:
@@ -101,9 +110,13 @@ appropriate instruction file without replacing existing content:
 ## Long-running commands with Longrun MCP
 
 - For reviewed, trusted, non-interactive commands expected to run longer than
-  about 30 seconds, prefer `longrun.run_and_wait` when it is available.
-- Pass the command as an argument array, use this project's absolute root as
-  `cwd`, make one call, and wait for the terminal result without polling.
+  about 30 seconds, use `longrun.start_job` once when it is available.
+- Pass the command as an argument array and use this project's absolute root as
+  `cwd`. Report the returned job ID and end the turn without polling.
+- Do not claim that Codex will wake automatically. Use `longrun.get_job` once
+  in a later turn. If it is still running, do not poll again in that turn.
+- Treat `longrun.run_and_wait` as legacy compatibility mode. Current Codex
+  runtimes may turn a pending blocking call into model-driven wait cycles.
 - Never pass secrets. Do not use longrun for interactive commands, password
   prompts, daemons, detached processes, or unreviewed commands.
 ```
@@ -111,6 +124,11 @@ appropriate instruction file without replacing existing content:
 If the project already has `AGENTS.md`, preserve every unrelated instruction.
 A same-directory `AGENTS.override.md` replaces rather than merges with
 `AGENTS.md`, so do not introduce one casually.
+
+When `/goal` is active and there is no useful work independent of the running
+job, tell the user to pause the goal before waiting and resume it for the agreed
+result check. The MCP server cannot wake or resume an idle goal. Do not create
+busywork or short-interval status calls to keep a goal active.
 
 ## 5. Restart or resume the session
 
@@ -138,11 +156,18 @@ In the new session, use `/mcp` or call `longrun.health`. Confirm that:
 - the server version is the expected installed version;
 - the exact project root appears in `allowed_roots`;
 - shell execution remains disabled;
-- heartbeat and timeout values match the intended policy.
+- heartbeat is zero unless a specific client was verified for progress;
+- timeout and maximum-active-job values match the intended policy.
 
-For an end-to-end check, run one harmless, bounded, non-interactive command in
-the enrolled root. Do not use a real build merely to test registration. Verify
-one terminal result and do not poll it.
+For an end-to-end check, submit one harmless, bounded, non-interactive command
+with `start_job`. Do not use a real build merely to test registration. Let it
+finish without MCP status calls, then use `get_job` exactly once and verify the
+terminal result.
+
+Run this check in an interactive Codex process that remains open. Do not use a
+one-shot `codex exec` process for a long asynchronous pilot: after its final
+response it closes the MCP server, and the parent-death supervisor safely
+terminates the command instead of leaving detached work behind.
 
 ## 7. Hand off the result
 
@@ -161,7 +186,7 @@ separate in the shared state directory.
 
 ## Troubleshooting
 
-`run_and_wait` reports that `cwd` is outside `LONGRUN_ALLOWED_ROOTS`:
+A command tool reports that `cwd` is outside `LONGRUN_ALLOWED_ROOTS`:
 
 - resume with the intended `-C` value;
 - enroll that exact project root;

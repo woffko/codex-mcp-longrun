@@ -62,13 +62,131 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
                 health = await asyncio.wait_for(session.call_tool("health", {}), 5)
 
         self.assertEqual(initialized.server_info.name, "codex-longrun")
-        self.assertEqual([tool.name for tool in tools.tools], ["health", "run_and_wait", "read_log_tail"])
+        self.assertEqual(
+            [tool.name for tool in tools.tools],
+            ["health", "start_job", "get_job", "cancel_job", "run_and_wait", "read_log_tail"],
+        )
         run_tool = next(tool for tool in tools.tools if tool.name == "run_and_wait")
         self.assertNotIn("ctx", run_tool.input_schema.get("properties", {}))
         self.assertFalse(health.is_error)
         self.assertTrue(health.structured_content["ok"])
         self.assertEqual(health.structured_content["heartbeat_initial_sec"], 1)
         self.assertEqual(health.structured_content["heartbeat_interval_sec"], 2)
+        self.assertEqual(health.structured_content["max_active_jobs"], 4)
+
+    async def test_01a_async_job_returns_promptly_and_finishes_without_status_calls(self) -> None:
+        params = StdioServerParameters(
+            command=str(TEST_ROOT / ".venv" / "bin" / "codex-mcp-longrun"),
+            env=dict(os.environ),
+            cwd=TEST_ROOT,
+        )
+        async with stdio_client(params) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                started = time.monotonic()
+                submitted = await session.call_tool(
+                    "start_job",
+                    {
+                        "argv": [
+                            sys.executable,
+                            "-c",
+                            "import time; time.sleep(1.2); print('async-final-marker')",
+                        ],
+                        "cwd": str(TEST_ROOT),
+                        "timeout_sec": 5,
+                    },
+                    read_timeout_seconds=5,
+                )
+                submit_duration = time.monotonic() - started
+                self.assertLess(submit_duration, 2.0)
+                self.assertFalse(submitted.is_error)
+                job_id = submitted.structured_content["job_id"]
+                self.assertRegex(job_id, r"^[a-f0-9]{32}$")
+                self.assertEqual(submitted.structured_content["state"], "running")
+                self.assertFalse(submitted.structured_content["automatic_wakeup"])
+
+                # The client deliberately makes no MCP status request while the command runs.
+                metadata_path = Path(submitted.structured_content["metadata_path"])
+                await _wait_for(
+                    lambda: json.loads(metadata_path.read_text(encoding="utf-8")).get("state")
+                    in server.TERMINAL_JOB_STATES,
+                    timeout=5,
+                )
+                completed = await session.call_tool("get_job", {"job_id": job_id}, read_timeout_seconds=5)
+
+        self.assertFalse(completed.is_error)
+        self.assertEqual(completed.structured_content["state"], "succeeded")
+        self.assertTrue(completed.structured_content["terminal"])
+        self.assertIn("async-final-marker", completed.structured_content["tail"])
+
+    async def test_01aa_second_server_does_not_recover_live_async_job_and_can_cancel_it(self) -> None:
+        pid_file = TEST_STATE / "cross-session-async.pid"
+        code = (
+            "import os,pathlib,sys,time; "
+            "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8'); "
+            "time.sleep(60)"
+        )
+        params = StdioServerParameters(
+            command=str(TEST_ROOT / ".venv" / "bin" / "codex-mcp-longrun"),
+            env=dict(os.environ),
+            cwd=TEST_ROOT,
+        )
+        async with stdio_client(params) as (first_read, first_write):
+            async with ClientSession(first_read, first_write) as first:
+                await first.initialize()
+                submitted = await first.call_tool(
+                    "start_job",
+                    {
+                        "argv": [sys.executable, "-c", code, str(pid_file)],
+                        "cwd": str(TEST_ROOT),
+                        "timeout_sec": 60,
+                        "grace_period_sec": 1,
+                    },
+                    read_timeout_seconds=5,
+                )
+                job_id = submitted.structured_content["job_id"]
+                await _wait_for(pid_file.is_file)
+                child_pid = int(pid_file.read_text(encoding="utf-8"))
+
+                async with stdio_client(params) as (second_read, second_write):
+                    async with ClientSession(second_read, second_write) as second:
+                        await second.initialize()
+                        live = await second.call_tool("get_job", {"job_id": job_id}, read_timeout_seconds=5)
+                        self.assertEqual(live.structured_content["state"], "running")
+                        cancelled = await second.call_tool(
+                            "cancel_job", {"job_id": job_id}, read_timeout_seconds=5
+                        )
+                        self.assertTrue(cancelled.structured_content["cancellation_requested"])
+                        await _wait_for(lambda: _pid_is_gone(child_pid), timeout=8)
+                        await asyncio.sleep(0.2)
+                        final = await second.call_tool("get_job", {"job_id": job_id}, read_timeout_seconds=5)
+
+        self.assertEqual(final.structured_content["state"], "cancelled")
+        self.assertTrue(final.structured_content["terminal"])
+
+    async def test_01ab_global_active_job_limit_is_locked(self) -> None:
+        fake_paths: list[Path] = []
+        try:
+            for index in range(server.MAX_ACTIVE_JOBS):
+                job_id = f"{index + 1:032x}"
+                path = TEST_STATE / "jobs" / f"{job_id}.json"
+                server._atomic_write_json(
+                    path,
+                    {
+                        "job_id": job_id,
+                        "state": "running",
+                        "server_pid": os.getpid(),
+                        "server_start_ticks": server._proc_start_ticks(os.getpid()),
+                        "started_at_utc": server._utc_now(),
+                        "cwd": str(TEST_ROOT),
+                    },
+                )
+                fake_paths.append(path)
+            with self.assertRaisesRegex(RuntimeError, "active job limit reached"):
+                server._reserve_job("f" * 32, str(TEST_ROOT))
+        finally:
+            for path in fake_paths:
+                path.unlink(missing_ok=True)
 
     async def test_01b_progress_heartbeats(self) -> None:
         progress_events: list[tuple[float, float | None, str | None]] = []
@@ -155,6 +273,17 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("must-not-reach-child", result.tail)
         tail = await server.read_log_tail(result.job_id, tail_bytes=4096)
         self.assertIn("final-marker", tail.tail)
+
+        metadata_path = Path(result.metadata_path)
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["cwd"] = "/tmp"
+        server._atomic_write_json(metadata_path, metadata)
+        with self.assertRaisesRegex(PermissionError, "outside the currently allowed roots"):
+            await server.get_job(result.job_id)
+        with self.assertRaisesRegex(PermissionError, "outside the currently allowed roots"):
+            await server.read_log_tail(result.job_id, tail_bytes=4096)
+        metadata["cwd"] = str(TEST_ROOT)
+        server._atomic_write_json(metadata_path, metadata)
 
     async def test_03_rejections_and_nonzero_exit(self) -> None:
         shell_link = TEST_STATE / "innocent-name"
