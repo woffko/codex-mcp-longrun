@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import AsyncMock, patch
 from pathlib import Path
 
 
@@ -119,6 +120,47 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(completed.structured_content["terminal"])
         self.assertIn("async-final-marker", completed.structured_content["tail"])
 
+    async def test_01a_goal_bridge_uses_trusted_request_meta_and_delivers_terminal(self) -> None:
+        thread_id = "019fa9f5-0c5d-75f3-85fb-0cd9d3e68797"
+
+        class RequestContext:
+            meta = {"threadId": thread_id}
+
+        class ToolContext:
+            request_context = RequestContext()
+
+        async def bridge_response(_socket: str, request: dict[str, object], **_kwargs: object):
+            if request["action"] == "prepare":
+                return {"ok": True, "automatic_wakeup": True}
+            if request["action"] == "terminal":
+                return {"ok": True, "delivery_state": "waiting_for_idle"}
+            raise AssertionError(f"unexpected bridge request: {request}")
+
+        mocked = AsyncMock(side_effect=bridge_response)
+        with patch.object(server, "BRIDGE_SOCKET", "/tmp/private-bridge.sock"), patch.object(
+            server, "request_bridge", mocked
+        ):
+            submitted = await server.start_job(
+                argv=[sys.executable, "-c", "print('bridge-terminal-marker')"],
+                cwd=str(TEST_ROOT),
+                timeout_sec=5,
+                wake_policy="goal",
+                ctx=ToolContext(),  # type: ignore[arg-type]
+            )
+            self.assertTrue(submitted.automatic_wakeup)
+            self.assertEqual(submitted.wake_delivery, "armed")
+            metadata_path = Path(submitted.metadata_path)
+            await _wait_for(
+                lambda: json.loads(metadata_path.read_text(encoding="utf-8")).get("wake_delivery")
+                == "waiting_for_idle",
+                timeout=5,
+            )
+
+        requests = [call.args[1] for call in mocked.await_args_list]
+        self.assertEqual([request["action"] for request in requests], ["prepare", "terminal"])
+        self.assertTrue(all(request["thread_id"] == thread_id for request in requests))
+        self.assertEqual(requests[1]["terminal_state"], "succeeded")
+
     async def test_01aa_second_server_does_not_recover_live_async_job_and_can_cancel_it(self) -> None:
         pid_file = TEST_STATE / "cross-session-async.pid"
         code = (
@@ -158,7 +200,12 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
                         )
                         self.assertTrue(cancelled.structured_content["cancellation_requested"])
                         await _wait_for(lambda: _pid_is_gone(child_pid), timeout=8)
-                        await asyncio.sleep(0.2)
+                        metadata_path = Path(submitted.structured_content["metadata_path"])
+                        await _wait_for(
+                            lambda: json.loads(metadata_path.read_text(encoding="utf-8")).get("state")
+                            in server.TERMINAL_JOB_STATES,
+                            timeout=8,
+                        )
                         final = await second.call_tool("get_job", {"job_id": job_id}, read_timeout_seconds=5)
 
         self.assertEqual(final.structured_content["state"], "cancelled")

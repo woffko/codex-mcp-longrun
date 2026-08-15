@@ -1,0 +1,169 @@
+"""Launch the official Codex App Server, Goal bridge, and remote TUI together."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import os
+import shutil
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+STARTUP_TIMEOUT_SEC = 20.0
+
+
+def _runtime_parent() -> Path:
+    configured = os.environ.get("XDG_RUNTIME_DIR")
+    candidate = Path(configured).expanduser() if configured else Path("/tmp")
+    candidate = candidate.resolve()
+    if not candidate.is_dir():
+        raise RuntimeError(f"runtime parent does not exist: {candidate}")
+    info = candidate.stat()
+    if configured and (info.st_uid != os.getuid() or info.st_mode & 0o077):
+        raise RuntimeError(f"XDG_RUNTIME_DIR is not private and same-user owned: {candidate}")
+    return candidate
+
+
+def _make_runtime_dir() -> Path:
+    preferred = _runtime_parent()
+    candidates = [preferred]
+    fallback = Path("/tmp").resolve()
+    if fallback != preferred:
+        candidates.append(fallback)
+    last_error: OSError | None = None
+    for parent in candidates:
+        try:
+            path = Path(tempfile.mkdtemp(prefix="codex-longrun-", dir=parent))
+        except OSError as exc:
+            last_error = exc
+            continue
+        path.chmod(0o700)
+        return path
+    raise RuntimeError(f"cannot create a private runtime directory: {last_error}")
+
+
+async def _wait_for_socket(path: Path, process: asyncio.subprocess.Process, label: str) -> None:
+    deadline = time.monotonic() + STARTUP_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        if path.is_socket():
+            return
+        if process.returncode is not None:
+            raise RuntimeError(f"{label} exited during startup with code {process.returncode}")
+        await asyncio.sleep(0.05)
+    raise RuntimeError(f"{label} did not create {path} within {STARTUP_TIMEOUT_SEC:g} seconds")
+
+
+async def _terminate(process: asyncio.subprocess.Process | None) -> None:
+    if process is None or process.returncode is not None:
+        return
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except TimeoutError:
+        process.kill()
+        await process.wait()
+
+
+async def _run(codex_args: list[str]) -> int:
+    codex = shutil.which("codex")
+    if codex is None:
+        raise RuntimeError("codex executable was not found in PATH")
+    runtime_dir = _make_runtime_dir()
+    app_socket = runtime_dir / "app.sock"
+    bridge_socket = runtime_dir / "bridge.sock"
+    state_db = runtime_dir / "bridge.sqlite3"
+    if len(str(app_socket).encode()) >= 100 or len(str(bridge_socket).encode()) >= 100:
+        shutil.rmtree(runtime_dir, ignore_errors=True)
+        raise RuntimeError("runtime path is too long for Unix-domain sockets")
+
+    app_process: asyncio.subprocess.Process | None = None
+    bridge_process: asyncio.subprocess.Process | None = None
+    tui_process: asyncio.subprocess.Process | None = None
+    try:
+        app_env = dict(os.environ)
+        app_env["LONGRUN_BRIDGE_SOCKET"] = str(bridge_socket)
+        app_process = await asyncio.create_subprocess_exec(
+            codex,
+            "app-server",
+            "--listen",
+            f"unix://{app_socket}",
+            env=app_env,
+        )
+        await _wait_for_socket(app_socket, app_process, "Codex App Server")
+
+        bridge_process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "codex_mcp_longrun.bridge",
+            "--app-server-socket",
+            str(app_socket),
+            "--bridge-socket",
+            str(bridge_socket),
+            "--state-db",
+            str(state_db),
+        )
+        await _wait_for_socket(bridge_socket, bridge_process, "codex-longrun bridge")
+
+        tui_process = await asyncio.create_subprocess_exec(
+            codex,
+            "--remote",
+            f"unix://{app_socket}",
+            *codex_args,
+        )
+        tui_wait = asyncio.create_task(tui_process.wait())
+        bridge_wait = asyncio.create_task(bridge_process.wait())
+        app_wait = asyncio.create_task(app_process.wait())
+        waits = {tui_wait, bridge_wait, app_wait}
+        done, pending = await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        for task in pending:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if tui_wait in done:
+            return tui_wait.result()
+        if bridge_wait in done:
+            raise RuntimeError(f"Goal bridge exited unexpectedly with code {bridge_wait.result()}")
+        raise RuntimeError(f"Codex App Server exited unexpectedly with code {app_wait.result()}")
+    finally:
+        await _terminate(tui_process)
+        await _terminate(bridge_process)
+        await _terminate(app_process)
+        # The target is the exact private directory returned by mkdtemp.
+        shutil.rmtree(runtime_dir, ignore_errors=True)
+
+
+def _parse_args() -> list[str]:
+    parser = argparse.ArgumentParser(
+        prog="codex-longrun",
+        description="Run the official Codex TUI with event-driven longrun Goal wakeups.",
+        add_help=False,
+    )
+    parser.add_argument("--bridge-help", action="store_true")
+    known, remaining = parser.parse_known_args()
+    if known.bridge_help:
+        print(
+            "Usage: codex-longrun [CODEX_OPTIONS] [PROMPT]\n"
+            "       codex-longrun resume [CODEX_RESUME_OPTIONS] [SESSION_ID]\n\n"
+            "All arguments except --bridge-help are passed to the official Codex CLI."
+        )
+        raise SystemExit(0)
+    return remaining
+
+
+def main() -> None:
+    codex_args = _parse_args()
+    try:
+        raise SystemExit(asyncio.run(_run(codex_args)))
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
+    except RuntimeError as exc:
+        raise SystemExit(f"codex-longrun: {exc}") from exc
+
+
+if __name__ == "__main__":
+    main()

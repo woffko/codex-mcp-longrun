@@ -4,12 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-mcp-longrun"
-version = "0.3.0"
+version = "0.4.0a1"
 description = "Local MCP server for bounded asynchronous command jobs with guarded execution"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "woffko" }]
-dependencies = ["mcp==2.0.0"]
+dependencies = [
+    "mcp==2.0.0",
+    "websockets>=15.0.1,<16",
+]
 
 [project.urls]
 Homepage = "https://github.com/woffko/codex-mcp-longrun"
@@ -17,6 +20,8 @@ Repository = "https://github.com/woffko/codex-mcp-longrun"
 
 [project.scripts]
 codex-mcp-longrun = "codex_mcp_longrun.server:main"
+codex-longrun = "codex_mcp_longrun.launcher:main"
+codex-longrun-bridge = "codex_mcp_longrun.bridge:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

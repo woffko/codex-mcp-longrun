@@ -1,26 +1,27 @@
 # Codex MCP Longrun
 
 Codex MCP Longrun is a local STDIO MCP server for bounded, non-interactive
-command jobs. Its default asynchronous workflow returns a job ID promptly so
-current Codex runtimes do not need to keep a blocking tool call alive through
-model-visible wait loops.
+command jobs. Its asynchronous workflow returns a job ID promptly so Codex
+does not need to keep a blocking tool call alive through model-visible wait
+loops. The experimental `codex-longrun` launcher can pause a durable Goal while
+the command runs and reactivate that exact Goal once terminal metadata exists.
 
 It is intended for builds, test suites, packaging jobs, and similar trusted
 foreground commands. The local server validates the request, supervises the
 process group, captures bounded output, and persists terminal metadata.
 
 ```text
-Codex calls longrun.start_job once
+Codex calls longrun.start_job once through codex-longrun
                   |
                   v
 The local MCP server starts the command,
-returns a job ID, and supervises it locally
+returns a job ID, and the bridge pauses the Goal
                   |
                   v
-Codex ends the turn without polling
+Codex ends the turn; the command runs without model polling
                   |
                   v
-Codex calls get_job once later
+Terminal event -> idle check -> Goal reactivated once
 ```
 
 The project is currently a Linux/WSL pilot, not a production release.
@@ -30,13 +31,15 @@ The project is currently a Linux/WSL pilot, not a production release.
 Repeatedly checking a long build with model-visible polling tools consumes
 context and may require additional model turns even when nothing changed.
 `start_job` avoids keeping the original tool call pending. It does not make the
-initial submission or a later result check token-free, and the MCP server cannot
-wake an idle Codex thread by itself.
+initial submission or resumed result turn token-free. In an ordinary `codex`
+process it cannot wake an idle thread; the opt-in launcher adds that client-side
+capability through the official experimental App Server protocol.
 
 Current Codex clients may turn a blocking MCP call into an outer executor cell
-and ask the model to wait for that cell repeatedly. For this reason,
-`run_and_wait` remains available only as a compatibility tool and is excluded
-from the default Codex tool allowlist.
+and ask the model to wait for that cell repeatedly. `run_and_wait` remains a
+compatibility tool, but the installer exposes it so a Goal can require the
+verified one-call workflow explicitly. Prefer `start_job` unless the current
+client has been verified to keep the original MCP call pending.
 
 While a legacy blocking call remains pending, the server can emit a short MCP
 progress heartbeat. Heartbeats are disabled by default because they do not
@@ -53,20 +56,21 @@ client has been verified to render progress without re-entering the model.
 | Tool | Purpose |
 | --- | --- |
 | `health` | Report the version, state paths, allowed roots, and active guardrails |
-| `start_job` | Start one command and return a durable local job ID promptly |
+| `start_job` | Start one command and optionally arm a durable Goal wake lease |
 | `get_job` | Read one bounded status or terminal result for a known job ID |
 | `cancel_job` | Request process-group cancellation for one exact job ID |
-| `run_and_wait` | Legacy blocking compatibility mode; disabled by default in Codex |
+| `run_and_wait` | Legacy blocking compatibility mode; exposed for explicit one-call workflows |
 | `read_log_tail` | Read a bounded tail for a known job ID |
 
-Do not repeatedly call `get_job` in the same turn. The asynchronous API removes
-the forced blocking wait, but event-driven completion still requires native
-support from the Codex client.
+Do not repeatedly call `get_job` in the same turn. Automatic Goal wakeup is
+available only when Codex was started through `codex-longrun` and the returned
+status says `automatic_wakeup = true`.
 
 ## Requirements
 
 - Linux or WSL;
-- [Codex CLI](https://developers.openai.com/codex/cli);
+- [Codex CLI](https://developers.openai.com/codex/cli) with App Server Unix
+  transport and Goal APIs (tested with Codex CLI `0.147.0`);
 - [`uv`](https://docs.astral.sh/uv/);
 - a trusted project directory for `LONGRUN_ALLOWED_ROOTS`.
 
@@ -80,6 +84,7 @@ Clone the repository and install the locked runtime:
 ```bash
 git clone https://github.com/woffko/codex-mcp-longrun.git
 cd codex-mcp-longrun
+git switch experimental
 ./scripts/install-runtime.sh
 ```
 
@@ -106,7 +111,8 @@ The configuration script:
 - refuses to overwrite an existing `mcp_servers.longrun` entry;
 - creates a timestamped private backup under `~/.codex/backups`;
 - keeps the MCP optional with `required = false`;
-- allows only `health`, `start_job`, `get_job`, `cancel_job`, and `read_log_tail`;
+- allows only `health`, `start_job`, `get_job`, `cancel_job`, `run_and_wait`, and `read_log_tail`;
+- forwards `LONGRUN_BRIDGE_SOCKET` only when the opt-in launcher sets it;
 - configures command start, cancellation, and log reads to require approval;
 - keeps bounded metadata-only `get_job` reads automatic;
 - disables shell and privilege-elevation executables;
@@ -127,6 +133,59 @@ Verify registration:
 codex mcp get longrun
 codex mcp list
 ```
+
+For an existing installation, apply the guarded config upgrade before
+reinstalling. It adds the bridge socket passthrough and keeps `run_and_wait`
+available without changing allowed roots or unrelated Codex settings:
+
+```bash
+./scripts/upgrade-codex.py --config "$HOME/.codex/config.toml" --dry-run
+./scripts/upgrade-codex.py --config "$HOME/.codex/config.toml"
+./scripts/install-runtime.sh
+```
+
+## Event-driven Goal launcher
+
+Use `codex-longrun` instead of `codex` for sessions that should suspend a Goal
+without model-visible polling:
+
+```bash
+~/.local/share/codex-longrun-mcp/.venv/bin/codex-longrun \
+  -C /absolute/path/to/project
+
+~/.local/share/codex-longrun-mcp/.venv/bin/codex-longrun \
+  resume -C /absolute/path/to/project SESSION_ID
+```
+
+The launcher starts the unmodified official `codex app-server`, a same-user
+bridge on private Unix sockets, and the official TUI in `--remote` mode. It does
+not build or replace Codex. Ordinary `codex` commands retain the manual
+two-turn behavior.
+
+For an active durable Goal, call `start_job` with `wake_policy="goal"`. The MCP
+server takes the thread identity from Codex request metadata, not from a
+model-controlled argument. Before the command starts, the bridge verifies the
+active Goal and changes it to `paused`. After terminal metadata is committed,
+the bridge waits for the current turn to become idle and changes the same Goal
+to `active`. That status transition starts the next Goal turn; the bridge does
+not also call `turn/start`.
+
+Only one automatic wake lease may be active for a Goal. Clearing, completing,
+blocking, editing, or manually resuming that Goal abandons the lease rather
+than overriding the user. An ambiguous activation failure is never retried
+automatically; resume the Goal manually in that case.
+
+### Copy-paste automatic Goal contract
+
+Replace the placeholders and start Codex through `codex-longrun` first:
+
+```text
+/goal Complete [OBJECTIVE] without stopping until [VERIFIABLE END STATE]. For every reviewed, trusted, non-interactive command expected to run longer than about 30 seconds, call longrun.start_job exactly once with argv as an array, an absolute cwd, sufficient hard and no-output timeouts, and wake_policy="goal". Require automatic_wakeup=true in the returned status. After start_job returns, report the job ID and state, end the current turn, and do not call get_job, run_and_wait, a generic wait tool, write_stdin, log-tail checks, or any polling loop in that turn. The local bridge will pause this Goal while the command runs and reactivate this exact Goal only after terminal metadata is committed. In the automatically resumed turn, call longrun.get_job exactly once for the recorded job ID, analyze that terminal result, and continue the Goal. If automatic_wakeup is false or Goal wakeup setup fails, stop and report the failure instead of polling. Never pass credentials or secrets to longrun.
+```
+
+Waiting inside the bridge does not invoke the model. The initial submission and
+the automatically resumed turn still use model context and tokens; this is not
+a universal billing guarantee.
 
 ## Enroll additional projects
 
@@ -183,13 +242,13 @@ one-shot `codex exec` client exits after its response and closes its MCP server;
 the supervisor then terminates the command by design. This parent-death rule
 prevents detached work from outliving the client that started it.
 
-When a durable Codex `/goal` has no other useful work, pause the goal before
-waiting and resume it for the agreed result check. The MCP server cannot pause,
-resume, or wake a goal on its own.
+When using ordinary `codex`, pause a durable Goal manually before waiting and
+resume it for the agreed result check. The MCP server alone cannot control a
+Goal; only the opt-in App Server bridge can do so.
 
 ### Copy-paste Goal contract
 
-The current MCP server does not wake a paused Goal automatically. Put the
+An ordinary Codex process does not wake a paused Goal automatically. Put the
 no-polling contract directly in the Goal objective, then pause and resume the
 Goal from the Codex CLI as shown below.
 

@@ -54,9 +54,9 @@ enabled = true
 required = false
 startup_timeout_sec = 20
 tool_timeout_sec = 43500
-enabled_tools = ["health", "start_job", "get_job", "cancel_job", "read_log_tail"]
+enabled_tools = ["health", "start_job", "get_job", "cancel_job", "run_and_wait", "read_log_tail"]
 default_tools_approval_mode = "prompt"
-env_vars = [{forwarded_toml}]
+env_vars = [{forwarded_toml}{', ' if forwarded_toml else ''}"LONGRUN_BRIDGE_SOCKET"]
 
 [mcp_servers.longrun.env]
 LONGRUN_STATE_DIR = {_toml_string(str(state_dir))}
