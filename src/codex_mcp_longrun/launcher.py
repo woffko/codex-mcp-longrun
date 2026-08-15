@@ -10,10 +10,19 @@ import shutil
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 
 STARTUP_TIMEOUT_SEC = 20.0
+
+
+@dataclass(frozen=True)
+class LauncherOptions:
+    legacy_history_mode: str = "auto"
+    history_threshold_mib: int = 64
+    history_tail_turns: int = 5
+    helper_timeout_sec: float = 120.0
 
 
 def _runtime_parent() -> Path:
@@ -68,20 +77,23 @@ async def _terminate(process: asyncio.subprocess.Process | None) -> None:
         await process.wait()
 
 
-async def _run(codex_args: list[str]) -> int:
+async def _run(codex_args: list[str], options: LauncherOptions) -> int:
     codex = shutil.which("codex")
     if codex is None:
         raise RuntimeError("codex executable was not found in PATH")
     runtime_dir = _make_runtime_dir()
     app_socket = runtime_dir / "app.sock"
     bridge_socket = runtime_dir / "bridge.sock"
+    tui_socket = runtime_dir / "tui.sock"
     state_db = runtime_dir / "bridge.sqlite3"
-    if len(str(app_socket).encode()) >= 100 or len(str(bridge_socket).encode()) >= 100:
+    sockets = (app_socket, bridge_socket, tui_socket)
+    if any(len(str(path).encode()) >= 100 for path in sockets):
         shutil.rmtree(runtime_dir, ignore_errors=True)
         raise RuntimeError("runtime path is too long for Unix-domain sockets")
 
     app_process: asyncio.subprocess.Process | None = None
     bridge_process: asyncio.subprocess.Process | None = None
+    proxy_process: asyncio.subprocess.Process | None = None
     tui_process: asyncio.subprocess.Process | None = None
     try:
         app_env = dict(os.environ)
@@ -108,16 +120,36 @@ async def _run(codex_args: list[str]) -> int:
         )
         await _wait_for_socket(bridge_socket, bridge_process, "codex-longrun bridge")
 
+        proxy_process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "codex_mcp_longrun.tui_proxy",
+            "--app-server-socket",
+            str(app_socket),
+            "--tui-socket",
+            str(tui_socket),
+            "--legacy-history-mode",
+            options.legacy_history_mode,
+            "--history-threshold-mib",
+            str(options.history_threshold_mib),
+            "--history-tail-turns",
+            str(options.history_tail_turns),
+            "--helper-timeout-sec",
+            str(options.helper_timeout_sec),
+        )
+        await _wait_for_socket(tui_socket, proxy_process, "codex-longrun TUI proxy")
+
         tui_process = await asyncio.create_subprocess_exec(
             codex,
             "--remote",
-            f"unix://{app_socket}",
+            f"unix://{tui_socket}",
             *codex_args,
         )
         tui_wait = asyncio.create_task(tui_process.wait())
+        proxy_wait = asyncio.create_task(proxy_process.wait())
         bridge_wait = asyncio.create_task(bridge_process.wait())
         app_wait = asyncio.create_task(app_process.wait())
-        waits = {tui_wait, bridge_wait, app_wait}
+        waits = {tui_wait, proxy_wait, bridge_wait, app_wait}
         done, pending = await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
@@ -126,39 +158,69 @@ async def _run(codex_args: list[str]) -> int:
                 await task
         if tui_wait in done:
             return tui_wait.result()
+        if proxy_wait in done:
+            raise RuntimeError(
+                f"TUI compatibility proxy exited unexpectedly with code {proxy_wait.result()}"
+            )
         if bridge_wait in done:
             raise RuntimeError(f"Goal bridge exited unexpectedly with code {bridge_wait.result()}")
         raise RuntimeError(f"Codex App Server exited unexpectedly with code {app_wait.result()}")
     finally:
         await _terminate(tui_process)
+        await _terminate(proxy_process)
         await _terminate(bridge_process)
         await _terminate(app_process)
         # The target is the exact private directory returned by mkdtemp.
         shutil.rmtree(runtime_dir, ignore_errors=True)
 
 
-def _parse_args() -> list[str]:
+def _parse_args() -> tuple[list[str], LauncherOptions]:
     parser = argparse.ArgumentParser(
         prog="codex-longrun",
         description="Run the official Codex TUI with event-driven longrun Goal wakeups.",
         add_help=False,
     )
     parser.add_argument("--bridge-help", action="store_true")
+    parser.add_argument(
+        "--longrun-legacy-history",
+        choices=("auto", "omit", "off"),
+        default="auto",
+    )
+    parser.add_argument("--longrun-history-threshold-mib", type=int, default=64)
+    parser.add_argument("--longrun-history-tail-turns", type=int, default=5)
+    parser.add_argument("--longrun-history-timeout-sec", type=float, default=120.0)
     known, remaining = parser.parse_known_args()
     if known.bridge_help:
         print(
             "Usage: codex-longrun [CODEX_OPTIONS] [PROMPT]\n"
             "       codex-longrun resume [CODEX_RESUME_OPTIONS] [SESSION_ID]\n\n"
-            "All arguments except --bridge-help are passed to the official Codex CLI."
+            "Launcher options:\n"
+            "  --longrun-legacy-history {auto,omit,off}\n"
+            "  --longrun-history-threshold-mib N\n"
+            "  --longrun-history-tail-turns N\n"
+            "  --longrun-history-timeout-sec N\n\n"
+            "Other arguments are passed to the official Codex CLI."
         )
         raise SystemExit(0)
-    return remaining
+    if not 1 <= known.longrun_history_threshold_mib <= 127:
+        parser.error("--longrun-history-threshold-mib must be between 1 and 127")
+    if not 1 <= known.longrun_history_tail_turns <= 20:
+        parser.error("--longrun-history-tail-turns must be between 1 and 20")
+    if not 5 <= known.longrun_history_timeout_sec <= 600:
+        parser.error("--longrun-history-timeout-sec must be between 5 and 600")
+    options = LauncherOptions(
+        legacy_history_mode=known.longrun_legacy_history,
+        history_threshold_mib=known.longrun_history_threshold_mib,
+        history_tail_turns=known.longrun_history_tail_turns,
+        helper_timeout_sec=known.longrun_history_timeout_sec,
+    )
+    return remaining, options
 
 
 def main() -> None:
-    codex_args = _parse_args()
+    codex_args, options = _parse_args()
     try:
-        raise SystemExit(asyncio.run(_run(codex_args)))
+        raise SystemExit(asyncio.run(_run(codex_args, options)))
     except KeyboardInterrupt:
         raise SystemExit(130) from None
     except RuntimeError as exc:

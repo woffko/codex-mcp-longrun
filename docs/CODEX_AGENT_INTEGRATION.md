@@ -202,10 +202,10 @@ Multiple Codex sessions may use longrun concurrently. Each Codex process starts
 its own STDIO MCP server process, while job IDs and metadata files remain
 separate in the shared state directory.
 
-Each `codex-longrun` process also creates an isolated App Server and bridge
-socket directory. A wake lease is bound to the trusted `threadId` attached by
-Codex to the MCP request, not to the current working directory or a model
-argument.
+Each `codex-longrun` process also creates an isolated App Server, TUI proxy,
+and bridge socket directory. A wake lease is bound to the trusted `threadId`
+attached by Codex to the MCP request, not to the current working directory or
+a model argument.
 
 ## Troubleshooting
 

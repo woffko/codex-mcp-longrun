@@ -28,10 +28,12 @@ class AppServerClient:
         *,
         notification_handler: NotificationHandler | None = None,
         request_timeout_sec: float = 10.0,
+        max_message_bytes: int = 1 << 20,
     ) -> None:
         self.socket_path = socket_path
         self.notification_handler = notification_handler
         self.request_timeout_sec = request_timeout_sec
+        self.max_message_bytes = max_message_bytes
         self._connection: ClientConnection | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._next_id = 1
@@ -49,6 +51,7 @@ class AppServerClient:
                 uri="ws://localhost/rpc",
                 compression=None,
                 open_timeout=self.request_timeout_sec,
+                max_size=self.max_message_bytes,
             )
         except Exception as exc:
             raise AppServerError(f"cannot connect to Codex App Server: {exc}") from exc
@@ -60,7 +63,7 @@ class AppServerClient:
                     "clientInfo": {
                         "name": "codex_longrun_bridge",
                         "title": "Codex Longrun Goal Bridge",
-                        "version": "0.4.0a1",
+                        "version": "0.4.0a2",
                     },
                     "capabilities": {"experimentalApi": True},
                 },

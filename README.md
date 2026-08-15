@@ -28,7 +28,7 @@ The project is currently a Linux/WSL pilot, not a production release.
 
 > [!IMPORTANT]
 > This README describes the `experimental` branch and package version
-> `0.4.0a1`. Its recommended Goal workflow is `codex-longrun` plus
+> `0.4.0a2`. Its recommended Goal workflow is `codex-longrun` plus
 > `start_job(wake_policy="goal")`. The manual Goal and blocking workflows are
 > compatibility fallbacks and must not be combined with automatic wakeup.
 
@@ -167,9 +167,61 @@ without model-visible polling. This is the recommended workflow on the
 ```
 
 The launcher starts the unmodified official `codex app-server`, a same-user
-bridge on private Unix sockets, and the official TUI in `--remote` mode. It does
-not build or replace Codex. Ordinary `codex` commands retain the manual
-two-turn behavior.
+Goal bridge, a bounded TUI compatibility proxy on private Unix sockets, and the
+official TUI in `--remote` mode. It does not build or replace Codex. Ordinary
+`codex` commands retain the manual two-turn behavior.
+
+### Large Legacy session compatibility
+
+Codex App Server defines `thread/read(includeTurns=true)` as a full-history
+operation. A very large Legacy JSONL session can therefore produce a single
+WebSocket response larger than the official TUI's receive limit. The launcher
+now routes only TUI traffic through a local compatibility proxy:
+
+```text
+official TUI -> tui.sock proxy -> official App Server
+                                      ^
+                                      |
+                          Goal bridge stays direct
+```
+
+The default `auto` mode forwards normal traffic unchanged. For a Legacy rollout
+at least 64 MiB in size, or when its local size cannot be determined safely, it
+replaces only the TUI's full `thread/read` response with the latest five turns
+obtained through experimental `thread/turns/list(itemsView="full")`. If that
+bounded tail is unavailable or exceeds 16 MiB, the TUI receives the thread
+summary with an empty visible turn list instead of an oversized frame.
+
+This affects visible scrollback only. `thread/resume`, live events, approvals,
+server requests, and all other JSON-RPC messages remain transparent, so App
+Server still loads the original session as the model-visible thread context.
+The proxy never edits, migrates, truncates, or rewrites a session JSONL file.
+The tested Codex 0.147.0 TUI resumes with `excludeTurns=true` and then hydrates
+Legacy scrollback through `thread/read`, which is the request the proxy bounds.
+
+Legacy pagination may still require App Server to scan the complete JSONL file
+once, so the first bounded tail can take time even though its returned frame is
+small. The result is a compatibility guard, not a session-file migration.
+
+Launcher controls are consumed locally and are not passed to Codex:
+
+```bash
+# Default: protect large Legacy sessions and show a five-turn tail.
+codex-longrun --longrun-legacy-history auto resume -C /project SESSION_ID
+
+# Fastest safe fallback: show no old turns for any Legacy session.
+codex-longrun --longrun-legacy-history omit resume -C /project SESSION_ID
+
+# Disable the compatibility guard. Large sessions may fail in the TUI.
+codex-longrun --longrun-legacy-history off resume -C /project SESSION_ID
+```
+
+Advanced bounds can be changed with
+`--longrun-history-threshold-mib`, `--longrun-history-tail-turns`, and
+`--longrun-history-timeout-sec`. Use `codex-longrun --bridge-help` for the
+accepted ranges. The implementation follows the official
+[Codex App Server protocol](https://developers.openai.com/codex/app-server);
+both the remote TUI transport and turn pagination are experimental upstream.
 
 Do not combine this workflow with manual `/goal pause`, manual `/goal resume`,
 or `run_and_wait` for the same job. The bridge owns the Goal status transition,

@@ -1,10 +1,13 @@
 # Event-Driven Codex Goal Wakeup
 
 The experimental `codex-longrun` launcher provides event-driven completion
-without a custom Codex build. It composes three processes:
+without a custom Codex build. It composes four processes:
 
 ```text
 official Codex TUI --remote
+            |
+            v
+bounded TUI compatibility proxy
             |
             v
 official codex app-server on a private Unix socket
@@ -18,6 +21,26 @@ The launcher exports a per-process `LONGRUN_BRIDGE_SOCKET` to App Server. The
 global MCP registration names that variable in `env_vars`, so only the MCP
 server spawned under this launcher receives the private bridge endpoint.
 Ordinary Codex processes do not create the variable and keep manual behavior.
+
+The TUI proxy is not part of Goal delivery. It transparently relays the
+bidirectional App Server protocol, including approvals and notifications. Its
+only compatibility intervention is a large Legacy
+`thread/read(includeTurns=true)`: in default `auto` mode, it returns a bounded
+latest-turn page or a summary with no visible turns. The Goal bridge keeps its
+own direct App Server connection, and `thread/resume` remains transparent, so
+the proxy changes TUI scrollback rather than the model-visible resumed context.
+On the tested Codex 0.147.0 path, the TUI sends `excludeTurns=true` on resume
+and follows it with the Legacy full read that the proxy intercepts.
+
+The protection modes are:
+
+- `auto`: protect Legacy rollouts at or above the configured local size
+  threshold, request a bounded newest-turn page, and fall back to no visible
+  turns;
+- `omit`: return no stored visible turns for every Legacy full-history read;
+- `off`: relay all reads unchanged, including potentially oversized ones.
+
+No mode edits the stored JSONL or changes its `historyMode`.
 
 ## Protocol
 
@@ -81,10 +104,13 @@ always uses manual behavior.
 
 ## Security boundary
 
-- App Server and bridge sockets live in a `0700` temporary directory.
-- The bridge socket is `0600` and checks Linux `SO_PEERCRED` for the current UID.
+- App Server, TUI proxy, and bridge sockets live in a `0700` temporary directory.
+- The TUI proxy and bridge sockets are `0600`; the proxy rejects a peer when
+  Linux `SO_PEERCRED` identifies a different UID.
 - Bridge messages are JSON lines capped at 64 KiB.
 - The bridge accepts no command, argument, environment, log, or output data.
+- The proxy caps normal TUI frames at 128 MiB and helper responses at 16 MiB.
+- The proxy logs only thread identifiers and error metadata, never turn data.
 - Job execution keeps the existing exact-root, no-shell, no-elevation, bounded
   timeout, bounded log, and process-group rules.
 - The App Server transport and Goal APIs are experimental. This implementation

@@ -35,7 +35,7 @@ from .bridge_protocol import BridgeError, request_bridge
 
 
 SERVER_NAME = "Codex MCP Longrun"
-SERVER_VERSION = "0.4.0a1"
+SERVER_VERSION = "0.4.0a2"
 DEFAULT_MAX_LOG_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_TIMEOUT_SEC = 12 * 60 * 60
 DEFAULT_HEARTBEAT_INITIAL_SEC = 0
