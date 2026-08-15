@@ -218,6 +218,25 @@ This manual pause/resume step remains necessary until an event-driven Codex
 client bridge is installed. Starting a job alone is not proof that the Goal
 will wake when the process exits.
 
+### Copy-paste uninterrupted Goal contract
+
+Use this variant only when `longrun.run_and_wait` is explicitly exposed in the
+current Codex session and that client has been verified to keep one MCP tool
+call pending without re-entering the model. The Goal stays active: the command
+runs inside the current turn, and Codex continues only after the same tool call
+returns its terminal result.
+
+Replace the bracketed placeholders and paste this as one command:
+
+```text
+/goal Complete [OBJECTIVE] without stopping until [VERIFIABLE END STATE]. For every reviewed, trusted, non-interactive command expected to run longer than about 30 seconds, call longrun.run_and_wait exactly once with argv as an array, an absolute cwd, and sufficient hard and no-output timeouts. Remain in that single MCP call until it returns a terminal result. Do not use longrun.start_job, longrun.get_job, a generic wait tool, write_stdin, log-tail checks, status polling, repeated tool calls, or periodic model commentary while the call is pending. Treat MCP progress notifications as UI-only progress and do not respond to them with another model turn. Continue this Goal only after the original run_and_wait call returns. Never pass credentials or secrets to longrun.
+```
+
+This pattern avoids deliberate model-visible polling and does not require
+pausing the Goal. It is not a universal billing guarantee: a Codex client that
+converts a pending MCP call into repeated model turns can still consume tokens.
+Use the asynchronous `start_job` contract above on an unverified client.
+
 ### Progress heartbeats
 
 Heartbeat timing is server-wide and can be changed in the
