@@ -187,6 +187,37 @@ When a durable Codex `/goal` has no other useful work, pause the goal before
 waiting and resume it for the agreed result check. The MCP server cannot pause,
 resume, or wake a goal on its own.
 
+### Copy-paste Goal contract
+
+The current MCP server does not wake a paused Goal automatically. Put the
+no-polling contract directly in the Goal objective, then pause and resume the
+Goal from the Codex CLI as shown below.
+
+Replace the bracketed placeholders and paste this as one command:
+
+```text
+/goal Complete [OBJECTIVE] without stopping until [VERIFIABLE END STATE]. For every reviewed, trusted, non-interactive command expected to run longer than about 30 seconds, call longrun.start_job exactly once with an absolute cwd. After start_job returns, report the job ID and state, end the turn, and do not call get_job, a generic wait tool, or any polling loop in that turn. Do not claim automatic wakeup. When I later resume this Goal and provide the job ID, call longrun.get_job exactly once. If the job is still running, report that state and end the turn without polling. Continue the Goal only after a terminal result. Never pass credentials or secrets to longrun.
+```
+
+After Codex reports the job ID, pause the Goal before another autonomous turn
+starts:
+
+```text
+/goal pause
+```
+
+When you are ready to read the result, resume the Goal and provide the exact
+job ID in the next message:
+
+```text
+/goal resume
+Call longrun.get_job exactly once for JOB_ID. If it is terminal, continue the Goal from that result. If it is still running, report the state and do not poll again in this turn.
+```
+
+This manual pause/resume step remains necessary until an event-driven Codex
+client bridge is installed. Starting a job alone is not proof that the Goal
+will wake when the process exits.
+
 ### Progress heartbeats
 
 Heartbeat timing is server-wide and can be changed in the
