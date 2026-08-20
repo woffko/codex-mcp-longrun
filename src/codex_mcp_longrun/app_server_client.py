@@ -63,7 +63,7 @@ class AppServerClient:
                     "clientInfo": {
                         "name": "codex_longrun_bridge",
                         "title": "Codex Longrun Goal Bridge",
-                        "version": "0.4.0a5",
+                        "version": "0.4.0a6",
                     },
                     "capabilities": {"experimentalApi": True},
                 },

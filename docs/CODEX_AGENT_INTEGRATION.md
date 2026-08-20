@@ -178,7 +178,8 @@ Start a new Codex process after installation or enrollment. To resume a known
 session in the verified project root with manual completion:
 
 ```bash
-codex resume -C /absolute/path/to/project SESSION_UUID
+cd /absolute/path/to/project
+codex resume SESSION_UUID
 ```
 
 To opt into event-driven Goal wakeup, resume through the installed launcher:
@@ -188,16 +189,19 @@ $HOME/.local/share/codex-longrun-mcp/.venv/bin/codex-longrun \
   resume -C /absolute/path/to/project SESSION_UUID
 ```
 
-The UUID selects conversation history. `-C` selects the current project root
-for the new process. They solve different problems and both should be explicit
-when the historical session was launched from another directory.
+The UUID selects conversation history. For ordinary Codex, changing the shell
+directory first also ensures that project-scoped `.codex/config.toml` is part
+of configuration discovery. Starting with `0.4.0a6`, `codex-longrun` resolves
+its `-C`/`--cd` argument before it starts App Server and uses that directory as
+the real process cwd, so the launcher form is safe from another directory.
 
 ## 6. Verify the integration
 
 Check the resolved Codex registration from the project:
 
 ```bash
-codex -C /absolute/path/to/project mcp get longrun
+cd /absolute/path/to/project
+codex mcp get longrun
 ```
 
 In the new session, use `/mcp` or call `longrun.health`. Confirm that:
@@ -225,7 +229,8 @@ terminates the command instead of leaving detached work behind.
 
 Report:
 
-- session UUID and executable `codex resume -C ...` command;
+- session UUID and executable project-root `codex resume ...` or
+  `codex-longrun resume -C ...` command;
 - enrolled exact root;
 - config backup path;
 - `codex mcp get longrun` and `longrun.health` results;

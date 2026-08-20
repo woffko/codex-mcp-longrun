@@ -28,7 +28,7 @@ The project is currently a Linux/WSL pilot, not a production release.
 
 > [!IMPORTANT]
 > This README describes the `experimental` branch and package version
-> `0.4.0a5`. Its recommended Goal workflow is `codex-longrun` plus
+> `0.4.0a6`. Its recommended Goal workflow is `codex-longrun` plus
 > `start_job(wake_policy="goal")`. The manual Goal and blocking workflows are
 > compatibility fallbacks and must not be combined with automatic wakeup.
 
@@ -205,8 +205,13 @@ section for event-driven Goal wakeup. Ordinary Codex can still resume the same
 saved session in manual fallback mode:
 
 ```bash
-codex resume -C /absolute/path/to/project SESSION_ID
+cd /absolute/path/to/project
+codex resume SESSION_ID
 ```
+
+Changing the shell directory first is important for project-scoped
+`.codex/config.toml` discovery. Do not assume that a later Codex `-C` option
+retroactively changes which configuration layers were loaded.
 
 Verify registration:
 
@@ -243,6 +248,11 @@ The launcher starts the unmodified official `codex app-server`, a same-user
 Goal bridge, a bounded TUI compatibility proxy on private Unix sockets, and the
 official TUI in `--remote` mode. It does not build or replace Codex. Ordinary
 `codex` commands retain the manual two-turn behavior.
+
+The launcher resolves Codex `-C`/`--cd` before starting App Server and starts
+both App Server and the remote TUI with that real process working directory.
+This ensures that project-scoped `.codex/config.toml` is loaded even when
+`codex-longrun` itself was invoked from another directory.
 
 ### Large Legacy session compatibility
 

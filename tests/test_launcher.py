@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
-from codex_mcp_longrun.launcher import LauncherOptions, _parse_args
+from codex_mcp_longrun.launcher import LauncherOptions, _parse_args, _resolve_codex_cwd
 
 
 class LauncherArgumentTests(unittest.TestCase):
@@ -44,6 +46,52 @@ class LauncherArgumentTests(unittest.TestCase):
 
         self.assertEqual(remaining, ["-C", "/project"])
         self.assertEqual(options, LauncherOptions())
+
+    def test_codex_cwd_is_resolved_before_app_server_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+
+            resolved = _resolve_codex_cwd(
+                ["resume", "-C", "project", "session-id"], base
+            )
+
+            self.assertEqual(resolved, project.resolve())
+
+    def test_codex_long_cd_form_is_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "project"
+            project.mkdir()
+
+            resolved = _resolve_codex_cwd([f"--cd={project}"], Path(directory))
+
+            self.assertEqual(resolved, project.resolve())
+
+    def test_codex_cwd_defaults_to_launcher_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+
+            self.assertEqual(_resolve_codex_cwd(["resume", "session-id"], base), base)
+
+    def test_codex_cwd_does_not_parse_arguments_after_separator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+
+            resolved = _resolve_codex_cwd(["--", "-C", "/missing"], base)
+
+            self.assertEqual(resolved, base)
+
+    def test_codex_cwd_rejects_missing_value(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "requires a working-directory"):
+            _resolve_codex_cwd(["resume", "-C"])
+
+    def test_codex_cwd_rejects_missing_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing"
+
+            with self.assertRaisesRegex(RuntimeError, "does not exist"):
+                _resolve_codex_cwd(["--cd", str(missing)], Path(directory))
 
 
 if __name__ == "__main__":

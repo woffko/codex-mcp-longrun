@@ -77,10 +77,45 @@ async def _terminate(process: asyncio.subprocess.Process | None) -> None:
         await process.wait()
 
 
+def _resolve_codex_cwd(
+    codex_args: list[str], invocation_cwd: Path | None = None
+) -> Path:
+    """Resolve Codex's -C/--cd before starting the App Server."""
+
+    base = (invocation_cwd or Path.cwd()).expanduser().resolve()
+    requested: str | None = None
+    index = 0
+    while index < len(codex_args):
+        argument = codex_args[index]
+        if argument == "--":
+            break
+        if argument in {"-C", "--cd"}:
+            if index + 1 >= len(codex_args):
+                raise RuntimeError(f"{argument} requires a working-directory argument")
+            requested = codex_args[index + 1]
+            index += 2
+            continue
+        if argument.startswith("--cd="):
+            requested = argument.removeprefix("--cd=")
+        index += 1
+
+    candidate = Path(requested).expanduser() if requested is not None else base
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"Codex working directory does not exist: {candidate}") from exc
+    if not resolved.is_dir():
+        raise RuntimeError(f"Codex working directory is not a directory: {resolved}")
+    return resolved
+
+
 async def _run(codex_args: list[str], options: LauncherOptions) -> int:
     codex = shutil.which("codex")
     if codex is None:
         raise RuntimeError("codex executable was not found in PATH")
+    codex_cwd = _resolve_codex_cwd(codex_args)
     runtime_dir = _make_runtime_dir()
     app_socket = runtime_dir / "app.sock"
     bridge_socket = runtime_dir / "bridge.sock"
@@ -103,6 +138,7 @@ async def _run(codex_args: list[str], options: LauncherOptions) -> int:
             "app-server",
             "--listen",
             f"unix://{app_socket}",
+            cwd=str(codex_cwd),
             env=app_env,
         )
         await _wait_for_socket(app_socket, app_process, "Codex App Server")
@@ -144,6 +180,7 @@ async def _run(codex_args: list[str], options: LauncherOptions) -> int:
             "--remote",
             f"unix://{tui_socket}",
             *codex_args,
+            cwd=str(codex_cwd),
         )
         tui_wait = asyncio.create_task(tui_process.wait())
         proxy_wait = asyncio.create_task(proxy_process.wait())
