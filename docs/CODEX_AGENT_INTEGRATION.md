@@ -15,8 +15,11 @@ controlled separately by exact entries in `LONGRUN_ALLOWED_ROOTS`.
   location.
 - Never enroll `/`, a user's home directory, or a broad workspace containing
   unrelated projects.
-- Never pass secrets in command arguments or store secrets in integration
-  documentation, Git, job logs, or Codex prompts.
+- Never put secret values in command arguments, MCP fields, prompts,
+  environment, integration documentation, Git, or job logs. For one reviewed
+  finite stdin secret, the user may stage it outside Codex with
+  `codex-longrun-secret`; the agent receives only the one-time
+  `stdin_secret_id` handle.
 - Do not create or modify `AGENTS.md` or `AGENTS.override.md` as an installation
   side effect. Add agent guidance only when the user explicitly requests it.
 - Preserve unrelated user configuration and worktree changes.
@@ -78,6 +81,18 @@ The upgrade also keeps `run_and_wait` in the global allowlist and adds
 value in ordinary Codex processes; the opt-in launcher creates a private value
 for its own App Server only.
 
+The installed `codex-longrun-secret` helper can stage one password outside
+Codex. It prompts with echo disabled and prints only a one-time handle:
+
+```bash
+$HOME/.local/share/codex-longrun-mcp/.venv/bin/codex-longrun-secret --confirm
+```
+
+Pass that handle as `stdin_secret_id`; never copy the secret value into the
+session. The configured defaults expire unconsumed handles after 300 seconds
+and cap the payload at 64 KiB. Secret-stdin jobs return no log or tail by
+design, even when the child prints its stdin.
+
 ## 3. Enroll another exact project root
 
 Preview the update first:
@@ -124,8 +139,12 @@ appropriate instruction file without replacing existing content:
   manually resumed turn.
 - Treat `longrun.run_and_wait` as legacy compatibility mode. Current Codex
   runtimes may turn a pending blocking call into model-driven wait cycles.
-- Never pass secrets. Do not use longrun for interactive commands, password
-  prompts, daemons, detached processes, or unreviewed commands.
+- Never pass secret values through argv, MCP fields, prompts, or environment.
+  A reviewed non-interactive command may receive one finite secret stdin
+  payload only through a user-created `codex-longrun-secret` handle. Output is
+  suppressed for that job, and text-match gates are unavailable. Do not use
+  longrun for interactive or TTY-dependent prompts, daemons, detached
+  processes, or unreviewed commands.
 ```
 
 If the project already has `AGENTS.md`, preserve every unrelated instruction.

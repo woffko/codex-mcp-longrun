@@ -79,6 +79,8 @@ class UpgradeCodexTests(unittest.TestCase):
         self.assertEqual(longrun["env_vars"], ["LONGRUN_BRIDGE_SOCKET"])
         self.assertEqual(longrun["env"]["LONGRUN_HEARTBEAT_INITIAL_SEC"], "0")
         self.assertEqual(longrun["env"]["LONGRUN_MAX_ACTIVE_JOBS"], "4")
+        self.assertEqual(longrun["env"]["LONGRUN_SECRET_TTL_SEC"], "300")
+        self.assertEqual(longrun["env"]["LONGRUN_MAX_STDIN_SECRET_BYTES"], "65536")
         self.assertEqual(longrun["tools"]["start_job"]["approval_mode"], "prompt")
         self.assertEqual(longrun["tools"]["get_job"]["approval_mode"], "auto")
         self.assertEqual(longrun["tools"]["cancel_job"]["approval_mode"], "prompt")

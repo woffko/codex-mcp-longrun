@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -26,6 +27,7 @@ os.environ["LONGRUN_HEARTBEAT_INTERVAL_SEC"] = "2"
 os.environ["OPENAI_API_KEY"] = "must-not-reach-child"
 
 from codex_mcp_longrun import server  # noqa: E402
+from codex_mcp_longrun.secret_input import create_one_time_secret, secret_dir  # noqa: E402
 from mcp.client.session import ClientSession  # noqa: E402
 from mcp.client.stdio import StdioServerParameters, stdio_client  # noqa: E402
 
@@ -69,11 +71,17 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
         )
         run_tool = next(tool for tool in tools.tools if tool.name == "run_and_wait")
         self.assertNotIn("ctx", run_tool.input_schema.get("properties", {}))
+        self.assertIn("stdin_secret_id", run_tool.input_schema.get("properties", {}))
+        start_tool = next(tool for tool in tools.tools if tool.name == "start_job")
+        self.assertIn("stdin_secret_id", start_tool.input_schema.get("properties", {}))
         self.assertFalse(health.is_error)
         self.assertTrue(health.structured_content["ok"])
         self.assertEqual(health.structured_content["heartbeat_initial_sec"], 1)
         self.assertEqual(health.structured_content["heartbeat_interval_sec"], 2)
         self.assertEqual(health.structured_content["max_active_jobs"], 4)
+        self.assertTrue(health.structured_content["secret_stdin_supported"])
+        self.assertEqual(health.structured_content["secret_ttl_sec"], 300)
+        self.assertEqual(health.structured_content["max_stdin_secret_bytes"], 65536)
 
     async def test_01a_async_job_returns_promptly_and_finishes_without_status_calls(self) -> None:
         params = StdioServerParameters(
@@ -160,6 +168,39 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([request["action"] for request in requests], ["prepare", "terminal"])
         self.assertTrue(all(request["thread_id"] == thread_id for request in requests))
         self.assertEqual(requests[1]["terminal_state"], "succeeded")
+
+    async def test_01a_async_secret_stdin_reaches_child_with_suppressed_output(self) -> None:
+        secret = b"async-fixture-password\n"
+        secret_id = create_one_time_secret(TEST_STATE, secret)
+        digest_path = TEST_STATE / "async-secret-digest.txt"
+        code = (
+            "import hashlib,pathlib,sys; value=sys.stdin.buffer.read(); "
+            "pathlib.Path(sys.argv[1]).write_text(hashlib.sha256(value).hexdigest(), encoding='ascii'); "
+            "sys.stdout.buffer.write(value); sys.stdout.flush()"
+        )
+        submitted = await server.start_job(
+            argv=[sys.executable, "-c", code, str(digest_path)],
+            cwd=str(TEST_ROOT),
+            stdin_secret_id=secret_id,
+            timeout_sec=5,
+            wake_policy="none",
+        )
+        await _wait_for(
+            lambda: json.loads(Path(submitted.metadata_path).read_text(encoding="utf-8")).get("state")
+            in server.TERMINAL_JOB_STATES,
+            timeout=5,
+        )
+        completed = await server.get_job(submitted.job_id)
+        self.assertEqual(completed.state, "succeeded")
+        self.assertTrue(completed.stdin_secret_supplied)
+        self.assertTrue(completed.output_suppressed)
+        self.assertEqual(completed.tail, "")
+        self.assertEqual(
+            digest_path.read_text(encoding="ascii"),
+            hashlib.sha256(secret).hexdigest(),
+        )
+        self.assertNotIn(secret.strip(), Path(completed.metadata_path).read_bytes())
+        self.assertEqual(Path(completed.log_path).read_bytes(), b"")
 
     async def test_01aa_second_server_does_not_recover_live_async_job_and_can_cancel_it(self) -> None:
         pid_file = TEST_STATE / "cross-session-async.pid"
@@ -331,6 +372,84 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
             await server.read_log_tail(result.job_id, tail_bytes=4096)
         metadata["cwd"] = str(TEST_ROOT)
         server._atomic_write_json(metadata_path, metadata)
+
+    async def test_02a_one_time_secret_stdin_is_received_but_never_captured(self) -> None:
+        secret = b"fixture-router-password\n"
+        secret_id = create_one_time_secret(TEST_STATE, secret)
+        digest_path = TEST_STATE / "secret-stdin-digest.txt"
+        code = (
+            "import hashlib,pathlib,sys; "
+            "value=sys.stdin.buffer.read(); "
+            "pathlib.Path(sys.argv[1]).write_text(hashlib.sha256(value).hexdigest(), encoding='ascii'); "
+            "sys.stdout.buffer.write(value); "
+            "print('ordinary-output', flush=True)"
+        )
+        result = await server.run_and_wait(
+            argv=[sys.executable, "-c", code, str(digest_path)],
+            cwd=str(TEST_ROOT),
+            stdin_secret_id=secret_id,
+            timeout_sec=5,
+            tail_bytes=4096,
+        )
+        self.assertEqual(result.state, "succeeded")
+        self.assertEqual(
+            digest_path.read_text(encoding="ascii"),
+            hashlib.sha256(secret).hexdigest(),
+        )
+        self.assertTrue(result.stdin_secret_supplied)
+        self.assertTrue(result.output_suppressed)
+        self.assertEqual(result.tail, "")
+        self.assertGreater(result.output_bytes_seen, 0)
+        self.assertEqual(result.output_bytes_logged, 0)
+        self.assertFalse((secret_dir(TEST_STATE) / f"{secret_id}.stdin").exists())
+
+        metadata_path = Path(result.metadata_path)
+        metadata_bytes = metadata_path.read_bytes()
+        log_bytes = Path(result.log_path).read_bytes()
+        tail_bytes = (TEST_STATE / "jobs" / f"{result.job_id}.tail.txt").read_bytes()
+        serialized_result = result.model_dump_json().encode("utf-8")
+        for value in (secret.strip(), secret_id.encode("ascii")):
+            self.assertNotIn(value, metadata_bytes)
+            self.assertNotIn(value, log_bytes)
+            self.assertNotIn(value, tail_bytes)
+            self.assertNotIn(value, serialized_result)
+        self.assertEqual(log_bytes, b"")
+        self.assertEqual(tail_bytes, b"")
+        metadata = json.loads(metadata_bytes)
+        self.assertTrue(metadata["stdin_secret_supplied"])
+        self.assertTrue(metadata["output_suppressed"])
+        self.assertNotIn("stdin_secret_id", metadata)
+        tail = await server.read_log_tail(result.job_id, tail_bytes=4096)
+        self.assertEqual(tail.tail, "")
+
+        reused = await server.run_and_wait(
+            argv=[sys.executable, "-c", "pass"],
+            cwd=str(TEST_ROOT),
+            stdin_secret_id=secret_id,
+            timeout_sec=5,
+        )
+        self.assertEqual(reused.state, "spawn_error")
+        self.assertIn("already consumed", reused.error or "")
+        self.assertNotIn(secret_id, reused.error or "")
+
+    async def test_02b_secret_handle_is_not_consumed_by_rejected_match_request(self) -> None:
+        secret_id = create_one_time_secret(TEST_STATE, b"match-secret\n")
+        rejected = await server.run_and_wait(
+            argv=[sys.executable, "-c", "pass"],
+            cwd=str(TEST_ROOT),
+            stdin_secret_id=secret_id,
+            success_contains="not-allowed",
+            timeout_sec=5,
+        )
+        self.assertEqual(rejected.state, "spawn_error")
+        self.assertIn("unavailable with secret stdin", rejected.error or "")
+        descriptor = server.claim_one_time_secret(
+            TEST_STATE,
+            secret_id,
+            ttl_sec=server.SECRET_TTL_SEC,
+            max_bytes=server.MAX_STDIN_SECRET_BYTES,
+        )
+        os.close(descriptor)
 
     async def test_03_rejections_and_nonzero_exit(self) -> None:
         shell_link = TEST_STATE / "innocent-name"

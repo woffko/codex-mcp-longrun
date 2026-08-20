@@ -28,7 +28,7 @@ The project is currently a Linux/WSL pilot, not a production release.
 
 > [!IMPORTANT]
 > This README describes the `experimental` branch and package version
-> `0.4.0a2`. Its recommended Goal workflow is `codex-longrun` plus
+> `0.4.0a3`. Its recommended Goal workflow is `codex-longrun` plus
 > `start_job(wake_policy="goal")`. The manual Goal and blocking workflows are
 > compatibility fallbacks and must not be combined with automatic wakeup.
 
@@ -71,6 +71,51 @@ client has been verified to render progress without re-entering the model.
 Do not repeatedly call `get_job` in the same turn. Automatic Goal wakeup is
 available only when Codex was started through `codex-longrun` and the returned
 status says `automatic_wakeup = true`.
+
+## One-time secret stdin
+
+Never put a password in `argv`, an MCP argument, an environment variable, a
+prompt, or a shell command line. When a reviewed non-interactive command reads
+one password or token from standard input, stage the value outside Codex in a
+second terminal:
+
+```bash
+~/.local/share/codex-longrun-mcp/.venv/bin/codex-longrun-secret --confirm
+```
+
+The prompt uses `getpass`; typed characters are not echoed. Stdout contains
+only a random 32-character one-time handle. Copy that handle—not the
+password—into the Codex request:
+
+```text
+Run the reviewed command with longrun.start_job, the normal argv and cwd,
+stdin_secret_id="ONE_TIME_HANDLE", and wake_policy="goal". Never place the
+secret value itself in any tool argument.
+```
+
+The handle expires after five minutes by default and is consumed once. The
+server validates the backing file's owner, `0600` mode, link count, type, age,
+and size with `O_NOFOLLOW`; it opens and immediately unlinks the file, then
+passes only the open descriptor to the supervised command's stdin. The handle
+and secret content are not stored in job metadata.
+
+Secret-stdin jobs always suppress stdout and stderr capture. Their log and
+tail remain empty even if the command accidentally echoes the password.
+Consequently, `success_contains` and `failure_contains` are rejected for these
+jobs; use the exit code and non-secret result artifacts instead. A command can
+still write the password into its own files or send it over the network, so
+review the command itself and its artifact paths before using this feature.
+
+This is a single finite stdin payload for a non-interactive program. Commands
+that require a TTY, repeated prompts, conversational input, or privilege
+elevation remain unsupported.
+
+This mechanism prevents the value from entering Codex transcripts, MCP
+arguments, process argv/environment, and Longrun output storage. Before it is
+consumed, the value exists briefly in a local `0600` file. It does not defend
+against root, another compromised process running as the same OS user, memory
+inspection, or filesystem forensics. Use an external secret broker or run the
+command manually when that stronger boundary is required.
 
 ## Requirements
 
@@ -124,6 +169,8 @@ The configuration script:
 - disables shell and privilege-elevation executables;
 - disables progress heartbeats by default;
 - limits all live jobs across local Codex sessions to four by default;
+- keeps one-time stdin handles for 300 seconds and limits their payload to
+  64 KiB by default;
 - gives Codex a tool timeout slightly longer than the server's 12-hour limit.
 
 Start a new Codex process after configuration. Existing on-screen processes do
@@ -245,7 +292,7 @@ automatically; resume the Goal manually in that case.
 Replace the placeholders and start Codex through `codex-longrun` first:
 
 ```text
-/goal Complete [OBJECTIVE] without stopping until [VERIFIABLE END STATE]. For every reviewed, trusted, non-interactive command expected to run longer than about 30 seconds, call longrun.start_job exactly once with argv as an array, an absolute cwd, sufficient hard and no-output timeouts, and wake_policy="goal". Require automatic_wakeup=true in the returned status. After start_job returns, report the job ID and state, end the current turn, and do not call get_job, run_and_wait, a generic wait tool, write_stdin, log-tail checks, or any polling loop in that turn. Do not manually pause or resume this Goal; the local bridge owns those transitions, will pause this Goal while the command runs, and will reactivate this exact Goal only after terminal metadata is committed. In the automatically resumed turn, call longrun.get_job exactly once for the recorded job ID, analyze that terminal result, and continue the Goal. If automatic_wakeup is false or Goal wakeup setup fails, stop and report the failure instead of polling. Never pass credentials or secrets to longrun.
+/goal Complete [OBJECTIVE] without stopping until [VERIFIABLE END STATE]. For every reviewed, trusted, non-interactive command expected to run longer than about 30 seconds, call longrun.start_job exactly once with argv as an array, an absolute cwd, sufficient hard and no-output timeouts, and wake_policy="goal". Require automatic_wakeup=true in the returned status. After start_job returns, report the job ID and state, end the current turn, and do not call get_job, run_and_wait, a generic wait tool, write_stdin, log-tail checks, or any polling loop in that turn. Do not manually pause or resume this Goal; the local bridge owns those transitions, will pause this Goal while the command runs, and will reactivate this exact Goal only after terminal metadata is committed. In the automatically resumed turn, call longrun.get_job exactly once for the recorded job ID, analyze that terminal result, and continue the Goal. If automatic_wakeup is false or Goal wakeup setup fails, stop and report the failure instead of polling. Never put a secret value in argv, MCP arguments, prompts, or environment. If one reviewed command needs one finite secret stdin payload, require the user to create a one-time handle with codex-longrun-secret and pass only that handle as stdin_secret_id; secret-stdin output is intentionally suppressed.
 ```
 
 Waiting inside the bridge does not invoke the model. The initial submission and
@@ -327,7 +374,7 @@ Goal from the Codex CLI as shown below.
 Replace the bracketed placeholders and paste this as one command:
 
 ```text
-/goal Complete [OBJECTIVE] without stopping until [VERIFIABLE END STATE]. For every reviewed, trusted, non-interactive command expected to run longer than about 30 seconds, call longrun.start_job exactly once with argv as an array, an absolute cwd, sufficient hard and no-output timeouts, and wake_policy="none". After start_job returns, report the job ID and state, end the current turn, and do not call get_job, run_and_wait, a generic wait tool, write_stdin, log-tail checks, or any polling loop in that turn. Do not claim automatic wakeup. When I later resume this Goal and provide the job ID, call longrun.get_job exactly once. If the job is still running, report that state and end the turn without polling. Continue the Goal only after a terminal result. Never pass credentials or secrets to longrun.
+/goal Complete [OBJECTIVE] without stopping until [VERIFIABLE END STATE]. For every reviewed, trusted, non-interactive command expected to run longer than about 30 seconds, call longrun.start_job exactly once with argv as an array, an absolute cwd, sufficient hard and no-output timeouts, and wake_policy="none". After start_job returns, report the job ID and state, end the turn, and do not call get_job, run_and_wait, a generic wait tool, write_stdin, log-tail checks, or any polling loop in that turn. Do not claim automatic wakeup. When I later resume this Goal and provide the job ID, call longrun.get_job exactly once. If the job is still running, report that state and end the turn without polling. Continue the Goal only after a terminal result. Never put a secret value in argv, MCP arguments, prompts, or environment. If one reviewed command needs one finite secret stdin payload, require the user to create a one-time handle with codex-longrun-secret and pass only that handle as stdin_secret_id; secret-stdin output is intentionally suppressed.
 ```
 
 After Codex reports the job ID, pause the Goal before another autonomous turn
@@ -361,7 +408,7 @@ returns its terminal result.
 Replace the bracketed placeholders and paste this as one command:
 
 ```text
-/goal Complete [OBJECTIVE] without stopping until [VERIFIABLE END STATE]. For every reviewed, trusted, non-interactive command expected to run longer than about 30 seconds, call longrun.run_and_wait exactly once with argv as an array, an absolute cwd, and sufficient hard and no-output timeouts. Remain in that single MCP call until it returns a terminal result. Do not use longrun.start_job, longrun.get_job, a generic wait tool, write_stdin, log-tail checks, status polling, repeated tool calls, or periodic model commentary while the call is pending. Treat MCP progress notifications as UI-only progress and do not respond to them with another model turn. Continue this Goal only after the original run_and_wait call returns. Never pass credentials or secrets to longrun.
+/goal Complete [OBJECTIVE] without stopping until [VERIFIABLE END STATE]. For every reviewed, trusted, non-interactive command expected to run longer than about 30 seconds, call longrun.run_and_wait exactly once with argv as an array, an absolute cwd, and sufficient hard and no-output timeouts. Remain in that single MCP call until it returns a terminal result. Do not use longrun.start_job, longrun.get_job, a generic wait tool, write_stdin, log-tail checks, status polling, repeated tool calls, or periodic model commentary while the call is pending. Treat MCP progress notifications as UI-only progress and do not respond to them with another model turn. Continue this Goal only after the original run_and_wait call returns. Never put a secret value in argv, MCP arguments, prompts, or environment. If one reviewed command needs one finite secret stdin payload, require the user to create a one-time handle with codex-longrun-secret and pass only that handle as stdin_secret_id; secret-stdin output is intentionally suppressed.
 ```
 
 This pattern avoids deliberate model-visible polling and does not require
@@ -379,6 +426,8 @@ Heartbeat timing is server-wide and can be changed in the
 | `LONGRUN_HEARTBEAT_INITIAL_SEC` | `0` | Delay before the first notification; `0` disables heartbeats |
 | `LONGRUN_HEARTBEAT_INTERVAL_SEC` | `900` | Interval between later notifications |
 | `LONGRUN_MAX_ACTIVE_JOBS` | `4` | Maximum live jobs across local Codex MCP server processes |
+| `LONGRUN_SECRET_TTL_SEC` | `300` | Maximum age of an unconsumed one-time stdin handle |
+| `LONGRUN_MAX_STDIN_SECRET_BYTES` | `65536` | Maximum staged secret stdin payload |
 
 `longrun.health` reports the effective values. The server silently disables
 heartbeats for the current job if notification delivery fails; the command
@@ -410,20 +459,25 @@ Additional safeguards include:
 - no tool parameter for injecting environment variables;
 - a small allowlist of inherited environment names;
 - no raw argument array in job metadata, only a redacted display and digest;
+- private one-time stdin handles whose values never enter MCP, argv,
+  environment, metadata, logs, or tails;
+- mandatory output suppression whenever secret stdin is used;
 - private state directories and files;
 - bounded logs and result tails;
 - a Linux supervisor that terminates the full command process group on normal
   completion, timeout, cancellation, or abrupt MCP-parent death;
 - startup recovery for incomplete metadata left by an interrupted server.
 
-Never pass passwords, tokens, API keys, private keys, cookies, or other secrets
-in arguments. Do not run commands that print secrets: command output is written
-to the local job log. Redaction is best-effort metadata hygiene, not a secret
-detection guarantee.
+Never pass passwords, tokens, API keys, private keys, cookies, or other secret
+values in arguments, MCP fields, prompts, or environment. Use the one-time
+stdin workflow only for a reviewed command that accepts one finite stdin
+payload. Normal command output is written to the local job log; secret-stdin
+jobs are the exception and suppress all captured output. Redaction remains
+best-effort metadata hygiene, not general secret detection.
 
 Do not use the server for interactive programs, REPLs, TUI applications,
-password prompts, indefinite servers, daemons, detached jobs, untrusted
-repositories, or unreviewed commands.
+TTY-dependent or repeated password prompts, indefinite servers, daemons,
+detached jobs, untrusted repositories, or unreviewed commands.
 
 ## Test
 
@@ -441,7 +495,8 @@ environment isolation, allowed-root and shell rejection, successful and failed
 commands, hard and inactivity timeouts, log truncation, cancellation,
 descendant cleanup, abrupt parent death, metadata recovery, safe config
 enrollment and upgrades, backup permissions, idempotency, broad-root rejection,
-and sanitized session-polling audits.
+sanitized session-polling audits, and one-time secret stdin with mandatory
+output suppression and no metadata/log/tail disclosure.
 
 ## Upgrade and rollback
 

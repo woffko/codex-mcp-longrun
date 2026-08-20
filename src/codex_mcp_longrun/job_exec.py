@@ -56,7 +56,12 @@ def _exit_code(wait_status: int) -> int:
     return 1
 
 
-def _supervise(command: list[str], grace_period_sec: int, status_fd: int) -> int:
+def _supervise(
+    command: list[str],
+    grace_period_sec: int,
+    status_fd: int,
+    stdin_secret_fd: int,
+) -> int:
     command_pid = os.fork()
     if command_pid == 0:
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
@@ -64,6 +69,10 @@ def _supervise(command: list[str], grace_period_sec: int, status_fd: int) -> int
         os.setsid()
         os.write(status_fd, f"{os.getpid()}\n".encode("ascii"))
         os.close(status_fd)
+        if stdin_secret_fd >= 0:
+            os.dup2(stdin_secret_fd, 0)
+            if stdin_secret_fd != 0:
+                os.close(stdin_secret_fd)
         try:
             os.execvpe(command[0], command, os.environ)
         except OSError as exc:
@@ -71,6 +80,8 @@ def _supervise(command: list[str], grace_period_sec: int, status_fd: int) -> int
             os._exit(127)
 
     os.close(status_fd)
+    if stdin_secret_fd >= 0:
+        os.close(stdin_secret_fd)
     termination_started_at: float | None = None
     while True:
         wait_info = os.waitid(os.P_PID, command_pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
@@ -94,10 +105,10 @@ def _supervise(command: list[str], grace_period_sec: int, status_fd: int) -> int
 
 
 def main() -> None:
-    if len(sys.argv) < 5:
+    if len(sys.argv) < 6:
         raise SystemExit(
             "usage: python -m codex_mcp_longrun.job_exec "
-            "PARENT_PID GRACE_SECONDS STATUS_FD COMMAND [ARG ...]"
+            "PARENT_PID GRACE_SECONDS STATUS_FD STDIN_SECRET_FD COMMAND [ARG ...]"
         )
 
     try:
@@ -119,12 +130,23 @@ def main() -> None:
     if status_fd < 3:
         raise SystemExit("status fd must not be a standard stream")
 
-    command = sys.argv[4:]
+    try:
+        stdin_secret_fd = int(sys.argv[4])
+    except ValueError as exc:
+        raise SystemExit("secret stdin fd must be an integer") from exc
+    if stdin_secret_fd not in {-1} and stdin_secret_fd < 3:
+        raise SystemExit("secret stdin fd must be -1 or not a standard stream")
+    if stdin_secret_fd == status_fd:
+        raise SystemExit("secret stdin fd must differ from status fd")
+
+    command = sys.argv[5:]
     os.umask(0o077)
     signal.signal(signal.SIGTERM, _request_termination)
     signal.signal(signal.SIGINT, _request_termination)
     _enable_parent_death_signal(expected_parent_pid)
-    raise SystemExit(_supervise(command, grace_period_sec, status_fd))
+    raise SystemExit(
+        _supervise(command, grace_period_sec, status_fd, stdin_secret_fd)
+    )
 
 
 if __name__ == "__main__":

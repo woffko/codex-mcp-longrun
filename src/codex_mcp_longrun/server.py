@@ -32,10 +32,17 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from .bridge_protocol import BridgeError, request_bridge
+from .secret_input import (
+    DEFAULT_MAX_SECRET_BYTES,
+    DEFAULT_SECRET_TTL_SEC,
+    SECRET_ID_RE,
+    claim_one_time_secret,
+    secret_dir,
+)
 
 
 SERVER_NAME = "Codex MCP Longrun"
-SERVER_VERSION = "0.4.0a2"
+SERVER_VERSION = "0.4.0a3"
 DEFAULT_MAX_LOG_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_TIMEOUT_SEC = 12 * 60 * 60
 DEFAULT_HEARTBEAT_INITIAL_SEC = 0
@@ -188,6 +195,18 @@ MAX_ACTIVE_JOBS = _read_int_env(
     1,
     64,
 )
+SECRET_TTL_SEC = _read_int_env(
+    "LONGRUN_SECRET_TTL_SEC",
+    DEFAULT_SECRET_TTL_SEC,
+    30,
+    3600,
+)
+MAX_STDIN_SECRET_BYTES = _read_int_env(
+    "LONGRUN_MAX_STDIN_SECRET_BYTES",
+    DEFAULT_MAX_SECRET_BYTES,
+    1,
+    1024 * 1024,
+)
 ALLOWED_ROOTS = _load_allowed_roots()
 FORWARD_ENV_NAMES = _load_forward_env_names()
 ALLOW_SHELL = _read_bool_env("LONGRUN_ALLOW_SHELL", False)
@@ -212,6 +231,7 @@ def _ensure_private_dir(path: Path) -> None:
 def _ensure_state_dirs() -> None:
     _ensure_private_dir(STATE_DIR)
     _ensure_private_dir(JOBS_DIR)
+    secret_dir(STATE_DIR)
 
 
 def _atomic_write_text(path: Path, text: str, mode: int = 0o600) -> None:
@@ -322,8 +342,11 @@ MCP_INSTRUCTIONS = (
     "get_job later for one bounded status read and do not claim automatic wakeup. cancel_job requires "
     "approval. run_and_wait is a legacy "
     "compatibility tool because some Codex runtimes turn a pending tool call into model-driven waits. "
-    "Pass argv as an array and cwd as an absolute path. Never pass secrets. Shell and privilege-elevation "
-    "commands are disabled. Full output stays in a private local log and only a bounded tail is returned. "
+    "Pass argv as an array and cwd as an absolute path. Never place a secret value in argv, MCP arguments, "
+    "or environment. For a command that reads one password from stdin, the user must stage it outside Codex "
+    "with codex-longrun-secret and provide only the one-time stdin_secret_id. Secret-stdin jobs suppress all "
+    "captured output and do not support success/failure text matching. Shell and privilege-elevation commands "
+    "are disabled. Normal job output stays in a private local log and only a bounded tail is returned. "
     "This server uses host-user permissions and is not a security sandbox."
 )
 
@@ -353,6 +376,9 @@ class HealthResult(BaseModel):
     heartbeat_interval_sec: int
     recovered_orphan_jobs: int
     bridge_configured: bool
+    secret_stdin_supported: bool
+    secret_ttl_sec: int
+    max_stdin_secret_bytes: int
 
 
 RunState = Literal[
@@ -394,6 +420,8 @@ class RunResult(BaseModel):
     output_bytes_seen: int
     output_bytes_logged: int
     log_truncated: bool
+    stdin_secret_supplied: bool = False
+    output_suppressed: bool = False
     success_match: str | None = None
     failure_match: str | None = None
     error: str | None = None
@@ -424,6 +452,8 @@ class JobStatusResult(BaseModel):
     output_bytes_seen: int = 0
     output_bytes_logged: int = 0
     log_truncated: bool = False
+    stdin_secret_supplied: bool = False
+    output_suppressed: bool = False
     success_match: str | None = None
     failure_match: str | None = None
     error: str | None = None
@@ -443,6 +473,7 @@ class OutputTracker:
     success_contains: str | None
     failure_contains: str | None
     last_output_at: float
+    suppress_output: bool = False
     bytes_seen: int = 0
     bytes_written: int = 0
     log_truncated: bool = False
@@ -456,6 +487,8 @@ class OutputTracker:
     def feed_text(self, text: str, raw_byte_count: int) -> None:
         self.last_output_at = time.monotonic()
         self.bytes_seen += raw_byte_count
+        if self.suppress_output:
+            return
         if not text:
             return
         self.tail_text = (self.tail_text + text)[-MAX_MEMORY_TAIL_CHARS:]
@@ -582,6 +615,8 @@ def _job_status_from_payload(
         output_bytes_seen=int(payload.get("output_bytes_seen", 0)),
         output_bytes_logged=int(payload.get("output_bytes_logged", 0)),
         log_truncated=bool(payload.get("log_truncated", False)),
+        stdin_secret_supplied=bool(payload.get("stdin_secret_supplied", False)),
+        output_suppressed=bool(payload.get("output_suppressed", False)),
         success_match=(str(payload["success_match"]) if payload.get("success_match") is not None else None),
         failure_match=(str(payload["failure_match"]) if payload.get("failure_match") is not None else None),
         error=str(payload["error"]) if payload.get("error") is not None else None,
@@ -747,6 +782,7 @@ async def _run_background_job(
     ready_event: asyncio.Event,
     registration: WakeRegistration | None,
     wake_metadata: dict[str, object],
+    stdin_secret_id: str | None,
 ) -> RunResult:
     try:
         return await _execute_job(
@@ -763,6 +799,7 @@ async def _run_background_job(
             None,
             ready_event,
             wake_metadata,
+            stdin_secret_id,
         )
     except asyncio.CancelledError:
         raise
@@ -925,6 +962,14 @@ def _validate_match_text(value: str | None, field_name: str) -> str | None:
     return value
 
 
+def _validate_stdin_secret_id(value: str | None) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or not SECRET_ID_RE.fullmatch(value):
+        raise ValueError("stdin_secret_id must be a 32-character lowercase hexadecimal handle")
+    return value
+
+
 def _limit_tail(text: str, max_lines: int, max_bytes: int) -> str:
     encoded = text.encode("utf-8", errors="replace")
     if len(encoded) > max_bytes:
@@ -946,6 +991,9 @@ async def _drain_output(stream: asyncio.StreamReader, log_path: Path, tracker: O
             chunk = await stream.read(64 * 1024)
             if not chunk:
                 break
+            if tracker.suppress_output:
+                tracker.feed_text("", len(chunk))
+                continue
             text = decoder.decode(chunk, final=False)
             tracker.feed_text(text, len(chunk))
             remaining = tracker.max_log_bytes - tracker.bytes_written
@@ -956,7 +1004,7 @@ async def _drain_output(stream: asyncio.StreamReader, log_path: Path, tracker: O
                 tracker.bytes_written += len(part)
             if len(chunk) > max(remaining, 0):
                 tracker.log_truncated = True
-        final_text = decoder.decode(b"", final=True)
+        final_text = "" if tracker.suppress_output else decoder.decode(b"", final=True)
         if final_text:
             tracker.feed_text(final_text, 0)
 
@@ -1114,6 +1162,9 @@ async def health() -> HealthResult:
         heartbeat_interval_sec=HEARTBEAT_INTERVAL_SEC,
         recovered_orphan_jobs=RECOVERED_ORPHAN_JOBS,
         bridge_configured=bool(BRIDGE_SOCKET),
+        secret_stdin_supported=True,
+        secret_ttl_sec=SECRET_TTL_SEC,
+        max_stdin_secret_bytes=MAX_STDIN_SECRET_BYTES,
     )
 
 
@@ -1131,6 +1182,7 @@ async def _execute_job(
     ctx: Context | None,
     ready_event: asyncio.Event | None = None,
     wake_metadata: dict[str, object] | None = None,
+    stdin_secret_id: str | None = None,
 ) -> RunResult:
     """Execute one validated job and persist a bounded terminal result."""
     _ensure_state_dirs()
@@ -1140,6 +1192,8 @@ async def _execute_job(
     tail_path = JOBS_DIR / f"{job_id}.tail.txt"
     metadata_path = JOBS_DIR / f"{job_id}.json"
     wake_metadata = dict(wake_metadata or {})
+    stdin_secret_supplied = stdin_secret_id not in (None, "")
+    output_suppressed = stdin_secret_supplied
 
     try:
         resolved_cwd = _resolve_cwd(cwd)
@@ -1148,6 +1202,13 @@ async def _execute_job(
             raise ValueError(f"timeout_sec exceeds configured maximum {MAX_TIMEOUT_SEC}")
         success_contains = _validate_match_text(success_contains, "success_contains")
         failure_contains = _validate_match_text(failure_contains, "failure_contains")
+        stdin_secret_id = _validate_stdin_secret_id(stdin_secret_id)
+        if stdin_secret_id is not None and (
+            success_contains is not None or failure_contains is not None
+        ):
+            raise ValueError(
+                "success_contains and failure_contains are unavailable with secret stdin"
+            )
         process_env = _build_process_env(resolved_cwd)
     except Exception as exc:
         result = RunResult(
@@ -1164,6 +1225,8 @@ async def _execute_job(
             output_bytes_seen=0,
             output_bytes_logged=0,
             log_truncated=False,
+            stdin_secret_supplied=stdin_secret_supplied,
+            output_suppressed=output_suppressed,
             error=f"validation error: {exc}",
         )
         _atomic_write_json(metadata_path, {**result.model_dump(), **wake_metadata})
@@ -1187,12 +1250,52 @@ async def _execute_job(
         "heartbeat_initial_sec": HEARTBEAT_INITIAL_SEC,
         "heartbeat_interval_sec": HEARTBEAT_INTERVAL_SEC,
         "forwarded_env_names": [name for name in FORWARD_ENV_NAMES if name in process_env],
+        "stdin_secret_supplied": stdin_secret_supplied,
+        "output_suppressed": output_suppressed,
         **wake_metadata,
     }
     _atomic_write_json(metadata_path, initial_metadata)
     _atomic_write_text(STATE_DIR / "latest-log-path", str(log_path) + "\n")
 
-    status_read_fd, status_write_fd = os.pipe()
+    stdin_secret_fd: int | None = None
+    if stdin_secret_id is not None:
+        try:
+            stdin_secret_fd = claim_one_time_secret(
+                STATE_DIR,
+                stdin_secret_id,
+                ttl_sec=SECRET_TTL_SEC,
+                max_bytes=MAX_STDIN_SECRET_BYTES,
+            )
+        except Exception as exc:
+            result = RunResult(
+                job_id=job_id,
+                state="spawn_error",
+                exit_code=None,
+                duration_sec=round(time.monotonic() - started_monotonic, 3),
+                started_at_utc=started_at,
+                finished_at_utc=_utc_now(),
+                command_display=command_display,
+                cwd=str(resolved_cwd),
+                log_path=str(log_path),
+                metadata_path=str(metadata_path),
+                output_bytes_seen=0,
+                output_bytes_logged=0,
+                log_truncated=False,
+                stdin_secret_supplied=True,
+                output_suppressed=True,
+                error=f"secret stdin error: {exc}",
+            )
+            _atomic_write_json(metadata_path, {**result.model_dump(), **wake_metadata})
+            if ready_event is not None:
+                ready_event.set()
+            return result
+
+    try:
+        status_read_fd, status_write_fd = os.pipe()
+    except Exception:
+        if stdin_secret_fd is not None:
+            os.close(stdin_secret_fd)
+        raise
     runner_argv = [
         sys.executable,
         "-m",
@@ -1200,6 +1303,7 @@ async def _execute_job(
         str(os.getpid()),
         str(grace_period_sec),
         str(status_write_fd),
+        str(stdin_secret_fd if stdin_secret_fd is not None else -1),
         *validated_argv,
     ]
     try:
@@ -1211,10 +1315,13 @@ async def _execute_job(
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                pass_fds=(status_write_fd,),
+                pass_fds=(status_write_fd,)
+                + ((stdin_secret_fd,) if stdin_secret_fd is not None else ()),
             )
         finally:
             os.close(status_write_fd)
+            if stdin_secret_fd is not None:
+                os.close(stdin_secret_fd)
     except Exception as exc:
         os.close(status_read_fd)
         result = RunResult(
@@ -1231,6 +1338,8 @@ async def _execute_job(
             output_bytes_seen=0,
             output_bytes_logged=0,
             log_truncated=False,
+            stdin_secret_supplied=stdin_secret_supplied,
+            output_suppressed=output_suppressed,
             error=f"spawn error: {type(exc).__name__}: {exc}",
         )
         _atomic_write_json(metadata_path, {**result.model_dump(), **wake_metadata})
@@ -1279,6 +1388,8 @@ async def _execute_job(
             output_bytes_seen=0,
             output_bytes_logged=0,
             log_truncated=False,
+            stdin_secret_supplied=stdin_secret_supplied,
+            output_suppressed=output_suppressed,
             error=f"supervisor startup error: {type(exc).__name__}: {exc}",
         )
         _atomic_write_json(metadata_path, {**result.model_dump(), **wake_metadata})
@@ -1303,6 +1414,7 @@ async def _execute_job(
         success_contains=success_contains,
         failure_contains=failure_contains,
         last_output_at=started_monotonic,
+        suppress_output=output_suppressed,
     )
     reader_task = asyncio.create_task(_drain_output(proc.stdout, log_path, tracker))
     stop_reason: Literal["timed_out", "inactive_timeout"] | None = None
@@ -1373,6 +1485,8 @@ async def _execute_job(
             output_bytes_seen=tracker.bytes_seen,
             output_bytes_logged=tracker.bytes_written,
             log_truncated=tracker.log_truncated,
+            stdin_secret_supplied=stdin_secret_supplied,
+            output_suppressed=output_suppressed,
             success_match=tracker.success_match,
             failure_match=tracker.failure_match,
             error=f"runtime error: {type(exc).__name__}: {exc}",
@@ -1407,6 +1521,8 @@ async def _execute_job(
             output_bytes_seen=tracker.bytes_seen,
             output_bytes_logged=tracker.bytes_written,
             log_truncated=tracker.log_truncated,
+            stdin_secret_supplied=stdin_secret_supplied,
+            output_suppressed=output_suppressed,
             success_match=tracker.success_match,
             failure_match=tracker.failure_match,
             tail=_limit_tail(tracker.tail_text, tail_lines, tail_bytes),
@@ -1453,6 +1569,16 @@ async def start_job(
         ),
     ],
     cwd: Annotated[str, Field(description="Absolute working directory inside LONGRUN_ALLOWED_ROOTS.")],
+    stdin_secret_id: Annotated[
+        str | None,
+        Field(
+            pattern=r"^[a-f0-9]{32}$",
+            description=(
+                "Optional one-time handle created outside Codex by codex-longrun-secret. "
+                "Never pass the password itself. Output is suppressed for this job."
+            ),
+        ),
+    ] = None,
     timeout_sec: Annotated[int, Field(ge=1, le=43200)] = 3600,
     no_output_timeout_sec: Annotated[int, Field(ge=0, le=43200)] = 0,
     grace_period_sec: Annotated[int, Field(ge=1, le=120)] = 10,
@@ -1480,6 +1606,13 @@ async def start_job(
             raise ValueError(f"timeout_sec exceeds configured maximum {MAX_TIMEOUT_SEC}")
         _validate_match_text(success_contains, "success_contains")
         _validate_match_text(failure_contains, "failure_contains")
+        _validate_stdin_secret_id(stdin_secret_id)
+        if stdin_secret_id is not None and (
+            success_contains not in (None, "") or failure_contains not in (None, "")
+        ):
+            raise ValueError(
+                "success_contains and failure_contains are unavailable with secret stdin"
+            )
     except Exception:
         resolved_cwd = None
     if resolved_cwd is not None:
@@ -1536,6 +1669,7 @@ async def start_job(
                 ready_event,
                 registration,
                 wake_metadata,
+                stdin_secret_id,
             ),
             name=f"codex-longrun-{job_id}",
         )
@@ -1633,6 +1767,16 @@ async def run_and_wait(
         ),
     ],
     cwd: Annotated[str, Field(description="Absolute working directory inside LONGRUN_ALLOWED_ROOTS.")],
+    stdin_secret_id: Annotated[
+        str | None,
+        Field(
+            pattern=r"^[a-f0-9]{32}$",
+            description=(
+                "Optional one-time handle created outside Codex by codex-longrun-secret. "
+                "Never pass the password itself. Output is suppressed for this job."
+            ),
+        ),
+    ] = None,
     timeout_sec: Annotated[int, Field(ge=1, le=43200)] = 3600,
     no_output_timeout_sec: Annotated[int, Field(ge=0, le=43200)] = 0,
     grace_period_sec: Annotated[int, Field(ge=1, le=120)] = 10,
@@ -1660,6 +1804,7 @@ async def run_and_wait(
         tail_lines,
         tail_bytes,
         ctx,
+        stdin_secret_id=stdin_secret_id,
     )
 
 
@@ -1676,7 +1821,13 @@ async def read_log_tail(
     _ensure_state_dirs()
     if not JOB_ID_RE.fullmatch(job_id):
         raise ValueError("invalid job_id")
-    _read_job_metadata(job_id)
+    payload = _read_job_metadata(job_id)
+    if bool(payload.get("output_suppressed", False)):
+        return LogTailResult(
+            job_id=job_id,
+            source_path=str(JOBS_DIR / f"{job_id}.log"),
+            tail="",
+        )
     tail_path = JOBS_DIR / f"{job_id}.tail.txt"
     log_path = JOBS_DIR / f"{job_id}.log"
     source = tail_path if tail_path.is_file() else log_path

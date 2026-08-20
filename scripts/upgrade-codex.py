@@ -159,6 +159,20 @@ def main() -> None:
         "4",
         preserve_existing=True,
     )
+    updated = _set_assignment(
+        updated,
+        f"mcp_servers.{args.server_name}.env",
+        "LONGRUN_SECRET_TTL_SEC",
+        "300",
+        preserve_existing=True,
+    )
+    updated = _set_assignment(
+        updated,
+        f"mcp_servers.{args.server_name}.env",
+        "LONGRUN_MAX_STDIN_SECRET_BYTES",
+        "65536",
+        preserve_existing=True,
+    )
     for tool, approval in TOOL_APPROVALS.items():
         updated = _ensure_tool_section(updated, args.server_name, tool, approval)
 
@@ -171,6 +185,8 @@ def main() -> None:
     if "LONGRUN_HEARTBEAT_INITIAL_SEC" not in expected_env or args.reset_heartbeat:
         expected_env["LONGRUN_HEARTBEAT_INITIAL_SEC"] = "0"
     expected_env.setdefault("LONGRUN_MAX_ACTIVE_JOBS", "4")
+    expected_env.setdefault("LONGRUN_SECRET_TTL_SEC", "300")
+    expected_env.setdefault("LONGRUN_MAX_STDIN_SECRET_BYTES", "65536")
     expected_tools = expected_server.setdefault("tools", {})
     for tool, approval in TOOL_APPROVALS.items():
         expected_tools.setdefault(tool, {"approval_mode": approval})
