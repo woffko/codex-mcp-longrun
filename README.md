@@ -28,7 +28,7 @@ The project is currently a Linux/WSL pilot, not a production release.
 
 > [!IMPORTANT]
 > This README describes the `experimental` branch and package version
-> `0.4.0a3`. Its recommended Goal workflow is `codex-longrun` plus
+> `0.4.0a4`. Its recommended Goal workflow is `codex-longrun` plus
 > `start_job(wake_policy="goal")`. The manual Goal and blocking workflows are
 > compatibility fallbacks and must not be combined with automatic wakeup.
 
@@ -298,6 +298,28 @@ Replace the placeholders and start Codex through `codex-longrun` first:
 Waiting inside the bridge does not invoke the model. The initial submission and
 the automatically resumed turn still use model context and tokens; this is not
 a universal billing guarantee.
+
+`collaboration.wait_agent` waits for delegated model agents; it has no
+relationship to a Longrun process and must never be used to wait for a Longrun
+job. The same prohibition applies to generic wait tools, `write_stdin`, log
+tails, and status loops in the submission turn.
+
+### If the Goal never pauses
+
+Inspect the `start_job` result. A bridge-enabled submission must have all of:
+
+```text
+wake_policy = "goal"
+automatic_wakeup = true
+wake_delivery = "armed"
+```
+
+`wake_policy="none"` deliberately bypasses the bridge, so the Goal remains
+active and native Goal continuation may immediately start another model turn.
+Do not wait in that turn. If a `codex-longrun` session returns
+`automatic_wakeup=false`, stop and report the setup failure instead of falling
+back to `collaboration.wait_agent` or polling. Use `none` only for ordinary
+Codex or an explicitly requested manual fallback.
 
 ## Enroll additional projects
 

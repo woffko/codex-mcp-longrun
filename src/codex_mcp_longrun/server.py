@@ -42,7 +42,7 @@ from .secret_input import (
 
 
 SERVER_NAME = "Codex MCP Longrun"
-SERVER_VERSION = "0.4.0a3"
+SERVER_VERSION = "0.4.0a4"
 DEFAULT_MAX_LOG_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_TIMEOUT_SEC = 12 * 60 * 60
 DEFAULT_HEARTBEAT_INITIAL_SEC = 0
@@ -335,11 +335,14 @@ RECOVERED_ORPHAN_JOBS = _recover_orphaned_jobs()
 
 MCP_INSTRUCTIONS = (
     "For a reviewed, trusted, non-interactive command expected to run longer than about 30 seconds, "
-    "use start_job once. It returns promptly with a job_id while the local server supervises the "
-    "command. Do not poll get_job in the same turn. When automatic_wakeup is true, the local bridge "
-    "has paused the current durable Goal and will reactivate that same Goal after the terminal job "
-    "metadata is committed and the current turn becomes idle. When automatic_wakeup is false, use "
-    "get_job later for one bounded status read and do not claim automatic wakeup. cancel_job requires "
+    "use start_job exactly once. In a codex-longrun session with an active durable Goal, pass "
+    "wake_policy='goal' and require automatic_wakeup=true. The bridge then owns the Goal's "
+    "active-to-paused-to-active transition. After start_job returns, report the job ID/state and end "
+    "the turn immediately. Never call get_job, collaboration.wait_agent, a generic wait tool, "
+    "write_stdin, log-tail tools, or polling in that submission turn. In the automatically resumed "
+    "turn, call get_job exactly once. Use wake_policy='none' only with ordinary Codex or an explicit "
+    "manual fallback; then end the turn without waiting and use get_job only in a later user-resumed "
+    "turn. When automatic_wakeup is false, do not claim wakeup. cancel_job requires "
     "approval. run_and_wait is a legacy "
     "compatibility tool because some Codex runtimes turn a pending tool call into model-driven waits. "
     "Pass argv as an array and cwd as an absolute path. Never place a secret value in argv, MCP arguments, "

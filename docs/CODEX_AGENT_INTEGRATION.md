@@ -135,8 +135,16 @@ appropriate instruction file without replacing existing content:
   `cwd`. Report the returned job ID and end the turn without polling.
 - Claim automatic wakeup only when Codex was launched through `codex-longrun`,
   `wake_policy="goal"` was requested, and the result says
-  `automatic_wakeup=true`. Otherwise use `longrun.get_job` once in a later
-  manually resumed turn.
+  `automatic_wakeup=true`. In that mode the bridge owns pause/resume; end the
+  submission turn immediately and call `longrun.get_job` exactly once only in
+  the automatically resumed turn. Otherwise use `longrun.get_job` once in a
+  later manually resumed turn.
+- Never use `collaboration.wait_agent`, a generic wait tool, `write_stdin`, log
+  tails, or status loops to wait for a Longrun job. `collaboration.wait_agent`
+  waits for delegated agents, not operating-system processes.
+- Use `wake_policy="none"` only with ordinary Codex or an explicitly requested
+  manual fallback. In a `codex-longrun` Goal session, require
+  `wake_policy="goal"` and `automatic_wakeup=true`; do not silently downgrade.
 - Treat `longrun.run_and_wait` as legacy compatibility mode. Current Codex
   runtimes may turn a pending blocking call into model-driven wait cycles.
 - Never pass secret values through argv, MCP fields, prompts, or environment.

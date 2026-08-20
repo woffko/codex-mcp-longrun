@@ -130,6 +130,7 @@ Goal turn:
 - Goal status changes `active -> paused -> active` for the same identity;
 - zero `get_job`, generic wait, `write_stdin`, or status calls before terminal
   metadata exists;
+- zero `collaboration.wait_agent` calls for Longrun process waiting;
 - exactly one terminal bridge event and one confirmed activation;
 - no bridge `turn/start` request;
 - at most one `get_job` in the resumed turn;
