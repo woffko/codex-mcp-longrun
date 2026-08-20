@@ -65,10 +65,15 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
                 health = await asyncio.wait_for(session.call_tool("health", {}), 5)
 
         self.assertEqual(initialized.server_info.name, "codex-longrun")
-        self.assertEqual(initialized.server_info.version, "0.4.0a4")
+        self.assertEqual(initialized.server_info.version, "0.4.0a5")
         self.assertIn("wake_policy='goal'", initialized.instructions or "")
         self.assertIn("collaboration.wait_agent", initialized.instructions or "")
         self.assertIn("wake_policy='none' only", initialized.instructions or "")
+        self.assertIn(
+            "project_memory_stage_test_asset_for_longrun",
+            initialized.instructions or "",
+        )
+        self.assertIn("do not ask the user to re-enter", initialized.instructions or "")
         self.assertEqual(
             [tool.name for tool in tools.tools],
             ["health", "start_job", "get_job", "cancel_job", "run_and_wait", "read_log_tail"],
@@ -80,7 +85,7 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("stdin_secret_id", start_tool.input_schema.get("properties", {}))
         self.assertFalse(health.is_error)
         self.assertTrue(health.structured_content["ok"])
-        self.assertEqual(health.structured_content["server_version"], "0.4.0a4")
+        self.assertEqual(health.structured_content["server_version"], "0.4.0a5")
         self.assertEqual(health.structured_content["heartbeat_initial_sec"], 1)
         self.assertEqual(health.structured_content["heartbeat_interval_sec"], 2)
         self.assertEqual(health.structured_content["max_active_jobs"], 4)

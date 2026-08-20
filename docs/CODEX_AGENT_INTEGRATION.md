@@ -81,8 +81,13 @@ The upgrade also keeps `run_and_wait` in the global allowlist and adds
 value in ordinary Codex processes; the opt-in launcher creates a private value
 for its own App Server only.
 
-The installed `codex-longrun-secret` helper can stage one password outside
-Codex. It prompts with echo disabled and prints only a one-time handle:
+When an encrypted Project Memory test asset exists, Codex should call
+`project_memory_stage_test_asset_for_longrun` and pass only the returned handle
+as `stdin_secret_id`. The plaintext never enters the model, and the user does
+not re-enter an enrolled credential.
+
+The installed `codex-longrun-secret` helper is only a fallback when no suitable
+test asset exists. It prompts with echo disabled and prints one handle:
 
 ```bash
 $HOME/.local/share/codex-longrun-mcp/.venv/bin/codex-longrun-secret --confirm
@@ -148,8 +153,10 @@ appropriate instruction file without replacing existing content:
 - Treat `longrun.run_and_wait` as legacy compatibility mode. Current Codex
   runtimes may turn a pending blocking call into model-driven wait cycles.
 - Never pass secret values through argv, MCP fields, prompts, or environment.
-  A reviewed non-interactive command may receive one finite secret stdin
-  payload only through a user-created `codex-longrun-secret` handle. Output is
+  For one finite secret stdin payload, prefer
+  `project_memory_stage_test_asset_for_longrun` when a suitable encrypted
+  test-only asset exists; do not ask the user to re-enter it. Use a
+  user-created `codex-longrun-secret` handle only as a fallback. Output is
   suppressed for that job, and text-match gates are unavailable. Do not use
   longrun for interactive or TTY-dependent prompts, daemons, detached
   processes, or unreviewed commands.

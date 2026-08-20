@@ -42,7 +42,7 @@ from .secret_input import (
 
 
 SERVER_NAME = "Codex MCP Longrun"
-SERVER_VERSION = "0.4.0a4"
+SERVER_VERSION = "0.4.0a5"
 DEFAULT_MAX_LOG_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_TIMEOUT_SEC = 12 * 60 * 60
 DEFAULT_HEARTBEAT_INITIAL_SEC = 0
@@ -346,8 +346,10 @@ MCP_INSTRUCTIONS = (
     "approval. run_and_wait is a legacy "
     "compatibility tool because some Codex runtimes turn a pending tool call into model-driven waits. "
     "Pass argv as an array and cwd as an absolute path. Never place a secret value in argv, MCP arguments, "
-    "or environment. For a command that reads one password from stdin, the user must stage it outside Codex "
-    "with codex-longrun-secret and provide only the one-time stdin_secret_id. Secret-stdin jobs suppress all "
+    "or environment. For a command that reads one password from stdin, prefer "
+    "project_memory_stage_test_asset_for_longrun when a suitable encrypted test-only asset exists, and pass "
+    "only its one-time stdin_secret_id; do not ask the user to re-enter an enrolled credential. Use "
+    "codex-longrun-secret only when no suitable asset exists. Secret-stdin jobs suppress all "
     "captured output and do not support success/failure text matching. Shell and privilege-elevation commands "
     "are disabled. Normal job output stays in a private local log and only a bounded tail is returned. "
     "This server uses host-user permissions and is not a security sandbox."
@@ -1577,8 +1579,9 @@ async def start_job(
         Field(
             pattern=r"^[a-f0-9]{32}$",
             description=(
-                "Optional one-time handle created outside Codex by codex-longrun-secret. "
-                "Never pass the password itself. Output is suppressed for this job."
+                "Optional one-time handle from project_memory_stage_test_asset_for_longrun or "
+                "the codex-longrun-secret fallback. Never pass the password itself. Output is "
+                "suppressed for this job."
             ),
         ),
     ] = None,
@@ -1775,8 +1778,9 @@ async def run_and_wait(
         Field(
             pattern=r"^[a-f0-9]{32}$",
             description=(
-                "Optional one-time handle created outside Codex by codex-longrun-secret. "
-                "Never pass the password itself. Output is suppressed for this job."
+                "Optional one-time handle from project_memory_stage_test_asset_for_longrun or "
+                "the codex-longrun-secret fallback. Never pass the password itself. Output is "
+                "suppressed for this job."
             ),
         ),
     ] = None,

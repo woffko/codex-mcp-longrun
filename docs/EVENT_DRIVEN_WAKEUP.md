@@ -113,10 +113,12 @@ always uses manual behavior.
 - The proxy logs only thread identifiers and error metadata, never turn data.
 - Job execution keeps the existing exact-root, no-shell, no-elevation, bounded
   timeout, bounded log, and process-group rules.
-- Secret stdin is staged outside Codex as a private short-lived one-time file;
-  only its opaque handle enters the MCP request. The server validates and
-  unlinks it before passing the open fd to the child. Secret-stdin output is
-  suppressed and no secret material enters bridge messages or metadata.
+- Secret stdin is staged locally by Project Memory from an enrolled encrypted
+  test asset, or by the manual helper when no asset exists, as a private
+  short-lived one-time file. Only its opaque handle enters the Longrun request.
+  The server validates and unlinks it before passing the open fd to the child.
+  Secret-stdin output is suppressed and no secret material enters bridge
+  messages or metadata.
 - The App Server transport and Goal APIs are experimental. This implementation
   is a Linux/WSL pilot, not a production daemon.
 
