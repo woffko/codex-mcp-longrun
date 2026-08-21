@@ -74,13 +74,18 @@ class UpgradeCodexTests(unittest.TestCase):
         longrun = parsed["mcp_servers"]["longrun"]
         self.assertEqual(
             longrun["enabled_tools"],
-            ["health", "start_job", "get_job", "cancel_job", "read_log_tail"],
+            ["health", "start_job", "get_job", "cancel_job", "run_and_wait", "read_log_tail"],
         )
+        self.assertEqual(longrun["env_vars"], ["LONGRUN_BRIDGE_SOCKET"])
         self.assertEqual(longrun["env"]["LONGRUN_HEARTBEAT_INITIAL_SEC"], "0")
         self.assertEqual(longrun["env"]["LONGRUN_MAX_ACTIVE_JOBS"], "4")
+        self.assertEqual(longrun["env"]["LONGRUN_SECRET_TTL_SEC"], "300")
+        self.assertEqual(longrun["env"]["LONGRUN_MAX_STDIN_SECRET_BYTES"], "65536")
         self.assertEqual(longrun["tools"]["start_job"]["approval_mode"], "prompt")
         self.assertEqual(longrun["tools"]["get_job"]["approval_mode"], "auto")
         self.assertEqual(longrun["tools"]["cancel_job"]["approval_mode"], "prompt")
+        self.assertEqual(longrun["tools"]["run_and_wait"]["approval_mode"], "prompt")
+        self.assertEqual(longrun["tools"]["read_log_tail"]["approval_mode"], "prompt")
         self.assertEqual(parsed["unrelated"]["marker"], "must-stay-unchanged")
         self.assertIn("# preserve this policy comment", updated_text)
         self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)

@@ -31,9 +31,18 @@ from mcp import types as mcp_types
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
+from .bridge_protocol import BridgeError, request_bridge
+from .secret_input import (
+    DEFAULT_MAX_SECRET_BYTES,
+    DEFAULT_SECRET_TTL_SEC,
+    SECRET_ID_RE,
+    claim_one_time_secret,
+    secret_dir,
+)
+
 
 SERVER_NAME = "Codex MCP Longrun"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.4.0a7"
 DEFAULT_MAX_LOG_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_TIMEOUT_SEC = 12 * 60 * 60
 DEFAULT_HEARTBEAT_INITIAL_SEC = 0
@@ -186,10 +195,23 @@ MAX_ACTIVE_JOBS = _read_int_env(
     1,
     64,
 )
+SECRET_TTL_SEC = _read_int_env(
+    "LONGRUN_SECRET_TTL_SEC",
+    DEFAULT_SECRET_TTL_SEC,
+    30,
+    3600,
+)
+MAX_STDIN_SECRET_BYTES = _read_int_env(
+    "LONGRUN_MAX_STDIN_SECRET_BYTES",
+    DEFAULT_MAX_SECRET_BYTES,
+    1,
+    1024 * 1024,
+)
 ALLOWED_ROOTS = _load_allowed_roots()
 FORWARD_ENV_NAMES = _load_forward_env_names()
 ALLOW_SHELL = _read_bool_env("LONGRUN_ALLOW_SHELL", False)
 DEBUG_STDIO = _read_bool_env("LONGRUN_DEBUG_STDIO", False)
+BRIDGE_SOCKET = os.environ.get("LONGRUN_BRIDGE_SOCKET", "").strip()
 
 
 def _debug_stdio(message: str) -> None:
@@ -209,6 +231,7 @@ def _ensure_private_dir(path: Path) -> None:
 def _ensure_state_dirs() -> None:
     _ensure_private_dir(STATE_DIR)
     _ensure_private_dir(JOBS_DIR)
+    secret_dir(STATE_DIR)
 
 
 def _atomic_write_text(path: Path, text: str, mode: int = 0o600) -> None:
@@ -312,13 +335,23 @@ RECOVERED_ORPHAN_JOBS = _recover_orphaned_jobs()
 
 MCP_INSTRUCTIONS = (
     "For a reviewed, trusted, non-interactive command expected to run longer than about 30 seconds, "
-    "use start_job once. It returns promptly with a job_id while the local server supervises the "
-    "command. Do not poll get_job in the same turn and do not claim that Codex will wake automatically; "
-    "automatic_wakeup is false until the Codex client provides event-driven completion. Use get_job "
-    "later for one bounded status read and cancel_job only after approval. run_and_wait is a legacy "
+    "use start_job exactly once. In a codex-longrun session with an active durable Goal, pass "
+    "wake_policy='goal' and require automatic_wakeup=true. The bridge then owns the Goal's "
+    "active-to-paused-to-active transition. After start_job returns, report the job ID/state and end "
+    "the turn immediately. Never call get_job, collaboration.wait_agent, a generic wait tool, "
+    "write_stdin, log-tail tools, or polling in that submission turn. In the automatically resumed "
+    "turn, call get_job exactly once. Use wake_policy='none' only with ordinary Codex or an explicit "
+    "manual fallback; then end the turn without waiting and use get_job only in a later user-resumed "
+    "turn. When automatic_wakeup is false, do not claim wakeup. cancel_job requires "
+    "approval. run_and_wait is a legacy "
     "compatibility tool because some Codex runtimes turn a pending tool call into model-driven waits. "
-    "Pass argv as an array and cwd as an absolute path. Never pass secrets. Shell and privilege-elevation "
-    "commands are disabled. Full output stays in a private local log and only a bounded tail is returned. "
+    "Pass argv as an array and cwd as an absolute path. Never place a secret value in argv, MCP arguments, "
+    "or environment. For a command that reads one password from stdin, prefer "
+    "project_memory_stage_test_asset_for_longrun when a suitable encrypted test-only asset exists, and pass "
+    "only its one-time stdin_secret_id; do not ask the user to re-enter an enrolled credential. Use "
+    "codex-longrun-secret only when no suitable asset exists. Secret-stdin jobs suppress all "
+    "captured output and do not support success/failure text matching. Shell and privilege-elevation commands "
+    "are disabled. Normal job output stays in a private local log and only a bounded tail is returned. "
     "This server uses host-user permissions and is not a security sandbox."
 )
 
@@ -347,6 +380,10 @@ class HealthResult(BaseModel):
     heartbeat_initial_sec: int
     heartbeat_interval_sec: int
     recovered_orphan_jobs: int
+    bridge_configured: bool
+    secret_stdin_supported: bool
+    secret_ttl_sec: int
+    max_stdin_secret_bytes: int
 
 
 RunState = Literal[
@@ -388,6 +425,8 @@ class RunResult(BaseModel):
     output_bytes_seen: int
     output_bytes_logged: int
     log_truncated: bool
+    stdin_secret_supplied: bool = False
+    output_suppressed: bool = False
     success_match: str | None = None
     failure_match: str | None = None
     error: str | None = None
@@ -405,6 +444,7 @@ class JobStatusResult(BaseModel):
     state: JobState
     terminal: bool
     automatic_wakeup: bool = False
+    wake_delivery: str | None = None
     recommended_check_after_sec: int | None = None
     exit_code: int | None = None
     duration_sec: float
@@ -417,6 +457,8 @@ class JobStatusResult(BaseModel):
     output_bytes_seen: int = 0
     output_bytes_logged: int = 0
     log_truncated: bool = False
+    stdin_secret_supplied: bool = False
+    output_suppressed: bool = False
     success_match: str | None = None
     failure_match: str | None = None
     error: str | None = None
@@ -436,6 +478,7 @@ class OutputTracker:
     success_contains: str | None
     failure_contains: str | None
     last_output_at: float
+    suppress_output: bool = False
     bytes_seen: int = 0
     bytes_written: int = 0
     log_truncated: bool = False
@@ -449,6 +492,8 @@ class OutputTracker:
     def feed_text(self, text: str, raw_byte_count: int) -> None:
         self.last_output_at = time.monotonic()
         self.bytes_seen += raw_byte_count
+        if self.suppress_output:
+            return
         if not text:
             return
         self.tail_text = (self.tail_text + text)[-MAX_MEMORY_TAIL_CHARS:]
@@ -470,6 +515,28 @@ TERMINAL_JOB_STATES = {
     "orphaned_recovered",
 }
 _BACKGROUND_JOBS: dict[str, asyncio.Task[RunResult]] = {}
+
+
+WakePolicy = Literal["auto", "goal", "none"]
+
+
+@dataclass(frozen=True)
+class WakeRegistration:
+    socket_path: str
+    thread_id: str
+
+
+def _thread_id_from_context(ctx: Context | None) -> str | None:
+    if ctx is None:
+        return None
+    try:
+        meta = ctx.request_context.meta
+    except (AttributeError, ValueError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    thread_id = meta.get("threadId")
+    return thread_id if isinstance(thread_id, str) else None
 
 
 def _new_job_id() -> str:
@@ -533,8 +600,13 @@ def _job_status_from_payload(
         job_id=job_id,
         state=state,  # type: ignore[arg-type]
         terminal=terminal,
-        automatic_wakeup=False,
-        recommended_check_after_sec=None if terminal else 600,
+        automatic_wakeup=bool(payload.get("automatic_wakeup", False)),
+        wake_delivery=(
+            str(payload["wake_delivery"]) if isinstance(payload.get("wake_delivery"), str) else None
+        ),
+        recommended_check_after_sec=(
+            None if terminal or bool(payload.get("automatic_wakeup", False)) else 600
+        ),
         exit_code=payload.get("exit_code") if isinstance(payload.get("exit_code"), int) else None,
         duration_sec=_elapsed_from_payload(payload),
         started_at_utc=str(payload.get("started_at_utc", "")),
@@ -548,6 +620,8 @@ def _job_status_from_payload(
         output_bytes_seen=int(payload.get("output_bytes_seen", 0)),
         output_bytes_logged=int(payload.get("output_bytes_logged", 0)),
         log_truncated=bool(payload.get("log_truncated", False)),
+        stdin_secret_supplied=bool(payload.get("stdin_secret_supplied", False)),
+        output_suppressed=bool(payload.get("output_suppressed", False)),
         success_match=(str(payload["success_match"]) if payload.get("success_match") is not None else None),
         failure_match=(str(payload["failure_match"]) if payload.get("failure_match") is not None else None),
         error=str(payload["error"]) if payload.get("error") is not None else None,
@@ -587,6 +661,165 @@ def _reserve_job(job_id: str, cwd: str) -> None:
                 "log_path": str(JOBS_DIR / f"{job_id}.log"),
             },
         )
+
+
+def _update_job_metadata(job_id: str, **fields: object) -> None:
+    path = _metadata_path(job_id)
+    with _locked_job_state():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = {"job_id": job_id, "started_at_utc": _utc_now(), "cwd": ""}
+        if not isinstance(payload, dict):
+            payload = {"job_id": job_id, "started_at_utc": _utc_now(), "cwd": ""}
+        payload.update(fields)
+        _atomic_write_json(path, payload)
+
+
+async def _prepare_wake_registration(
+    *,
+    job_id: str,
+    ctx: Context | None,
+    wake_policy: WakePolicy,
+    timeout_sec: int,
+    grace_period_sec: int,
+) -> tuple[WakeRegistration | None, str | None]:
+    if wake_policy == "none":
+        return None, None
+    thread_id = _thread_id_from_context(ctx)
+    if not BRIDGE_SOCKET or thread_id is None:
+        if wake_policy == "goal":
+            missing = "bridge socket" if not BRIDGE_SOCKET else "trusted Codex thread metadata"
+            raise RuntimeError(f"Goal wakeup requested but {missing} is unavailable")
+        return None, "bridge_unavailable"
+    try:
+        response = await request_bridge(
+            BRIDGE_SOCKET,
+            {
+                "action": "prepare",
+                "job_id": job_id,
+                "thread_id": thread_id,
+                "timeout_sec": timeout_sec,
+                "grace_period_sec": grace_period_sec,
+            },
+        )
+    except BridgeError as exc:
+        # A transport failure can be ambiguous: prepare may have reached the
+        # bridge and paused the Goal before the response was lost. Best-effort
+        # abort the exact job/thread lease before either failing or falling back.
+        try:
+            await request_bridge(
+                BRIDGE_SOCKET,
+                {
+                    "action": "abort",
+                    "job_id": job_id,
+                    "thread_id": thread_id,
+                },
+            )
+        except BridgeError:
+            pass
+        if wake_policy == "goal":
+            raise RuntimeError(f"Goal wakeup setup failed: {exc}") from exc
+        return None, "bridge_rejected"
+    if response.get("automatic_wakeup") is not True:
+        if wake_policy == "goal":
+            raise RuntimeError("Goal bridge did not confirm automatic wakeup")
+        return None, "bridge_not_armed"
+    return WakeRegistration(socket_path=BRIDGE_SOCKET, thread_id=thread_id), "armed"
+
+
+async def _abort_wake_registration(job_id: str, registration: WakeRegistration) -> None:
+    try:
+        await request_bridge(
+            registration.socket_path,
+            {
+                "action": "abort",
+                "job_id": job_id,
+                "thread_id": registration.thread_id,
+            },
+        )
+    except BridgeError:
+        _update_job_metadata(job_id, wake_delivery="abort_failed")
+
+
+async def _deliver_terminal_wakeup(job_id: str, registration: WakeRegistration) -> None:
+    try:
+        payload = _read_job_metadata(job_id)
+    except Exception:
+        return
+    state = str(payload.get("state", ""))
+    if state not in TERMINAL_JOB_STATES:
+        return
+    try:
+        response = await request_bridge(
+            registration.socket_path,
+            {
+                "action": "terminal",
+                "job_id": job_id,
+                "thread_id": registration.thread_id,
+                "terminal_state": state,
+            },
+        )
+        delivery = response.get("delivery_state")
+        _update_job_metadata(
+            job_id,
+            wake_delivery=str(delivery) if isinstance(delivery, str) else "accepted",
+        )
+    except BridgeError as exc:
+        _update_job_metadata(
+            job_id,
+            wake_delivery="delivery_failed",
+            wake_error=f"{type(exc).__name__}: {exc}",
+        )
+
+
+async def _run_background_job(
+    job_id: str,
+    argv: list[str],
+    cwd: str,
+    timeout_sec: int,
+    no_output_timeout_sec: int,
+    grace_period_sec: int,
+    success_contains: str | None,
+    failure_contains: str | None,
+    tail_lines: int,
+    tail_bytes: int,
+    ready_event: asyncio.Event,
+    registration: WakeRegistration | None,
+    wake_metadata: dict[str, object],
+    stdin_secret_id: str | None,
+) -> RunResult:
+    try:
+        return await _execute_job(
+            job_id,
+            argv,
+            cwd,
+            timeout_sec,
+            no_output_timeout_sec,
+            grace_period_sec,
+            success_contains,
+            failure_contains,
+            tail_lines,
+            tail_bytes,
+            None,
+            ready_event,
+            wake_metadata,
+            stdin_secret_id,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _update_job_metadata(
+            job_id,
+            state="spawn_error",
+            finished_at_utc=_utc_now(),
+            error=f"background task error: {type(exc).__name__}: {exc}",
+            **wake_metadata,
+        )
+        raise
+    finally:
+        if registration is not None:
+            await _deliver_terminal_wakeup(job_id, registration)
 
 
 def _consume_background_result(job_id: str, task: asyncio.Task[RunResult]) -> None:
@@ -734,6 +967,14 @@ def _validate_match_text(value: str | None, field_name: str) -> str | None:
     return value
 
 
+def _validate_stdin_secret_id(value: str | None) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or not SECRET_ID_RE.fullmatch(value):
+        raise ValueError("stdin_secret_id must be a 32-character lowercase hexadecimal handle")
+    return value
+
+
 def _limit_tail(text: str, max_lines: int, max_bytes: int) -> str:
     encoded = text.encode("utf-8", errors="replace")
     if len(encoded) > max_bytes:
@@ -755,6 +996,9 @@ async def _drain_output(stream: asyncio.StreamReader, log_path: Path, tracker: O
             chunk = await stream.read(64 * 1024)
             if not chunk:
                 break
+            if tracker.suppress_output:
+                tracker.feed_text("", len(chunk))
+                continue
             text = decoder.decode(chunk, final=False)
             tracker.feed_text(text, len(chunk))
             remaining = tracker.max_log_bytes - tracker.bytes_written
@@ -765,7 +1009,7 @@ async def _drain_output(stream: asyncio.StreamReader, log_path: Path, tracker: O
                 tracker.bytes_written += len(part)
             if len(chunk) > max(remaining, 0):
                 tracker.log_truncated = True
-        final_text = decoder.decode(b"", final=True)
+        final_text = "" if tracker.suppress_output else decoder.decode(b"", final=True)
         if final_text:
             tracker.feed_text(final_text, 0)
 
@@ -922,6 +1166,10 @@ async def health() -> HealthResult:
         heartbeat_initial_sec=HEARTBEAT_INITIAL_SEC,
         heartbeat_interval_sec=HEARTBEAT_INTERVAL_SEC,
         recovered_orphan_jobs=RECOVERED_ORPHAN_JOBS,
+        bridge_configured=bool(BRIDGE_SOCKET),
+        secret_stdin_supported=True,
+        secret_ttl_sec=SECRET_TTL_SEC,
+        max_stdin_secret_bytes=MAX_STDIN_SECRET_BYTES,
     )
 
 
@@ -938,6 +1186,8 @@ async def _execute_job(
     tail_bytes: int,
     ctx: Context | None,
     ready_event: asyncio.Event | None = None,
+    wake_metadata: dict[str, object] | None = None,
+    stdin_secret_id: str | None = None,
 ) -> RunResult:
     """Execute one validated job and persist a bounded terminal result."""
     _ensure_state_dirs()
@@ -946,6 +1196,9 @@ async def _execute_job(
     log_path = JOBS_DIR / f"{job_id}.log"
     tail_path = JOBS_DIR / f"{job_id}.tail.txt"
     metadata_path = JOBS_DIR / f"{job_id}.json"
+    wake_metadata = dict(wake_metadata or {})
+    stdin_secret_supplied = stdin_secret_id not in (None, "")
+    output_suppressed = stdin_secret_supplied
 
     try:
         resolved_cwd = _resolve_cwd(cwd)
@@ -954,6 +1207,13 @@ async def _execute_job(
             raise ValueError(f"timeout_sec exceeds configured maximum {MAX_TIMEOUT_SEC}")
         success_contains = _validate_match_text(success_contains, "success_contains")
         failure_contains = _validate_match_text(failure_contains, "failure_contains")
+        stdin_secret_id = _validate_stdin_secret_id(stdin_secret_id)
+        if stdin_secret_id is not None and (
+            success_contains is not None or failure_contains is not None
+        ):
+            raise ValueError(
+                "success_contains and failure_contains are unavailable with secret stdin"
+            )
         process_env = _build_process_env(resolved_cwd)
     except Exception as exc:
         result = RunResult(
@@ -970,9 +1230,11 @@ async def _execute_job(
             output_bytes_seen=0,
             output_bytes_logged=0,
             log_truncated=False,
+            stdin_secret_supplied=stdin_secret_supplied,
+            output_suppressed=output_suppressed,
             error=f"validation error: {exc}",
         )
-        _atomic_write_json(metadata_path, result.model_dump())
+        _atomic_write_json(metadata_path, {**result.model_dump(), **wake_metadata})
         if ready_event is not None:
             ready_event.set()
         return result
@@ -993,11 +1255,52 @@ async def _execute_job(
         "heartbeat_initial_sec": HEARTBEAT_INITIAL_SEC,
         "heartbeat_interval_sec": HEARTBEAT_INTERVAL_SEC,
         "forwarded_env_names": [name for name in FORWARD_ENV_NAMES if name in process_env],
+        "stdin_secret_supplied": stdin_secret_supplied,
+        "output_suppressed": output_suppressed,
+        **wake_metadata,
     }
     _atomic_write_json(metadata_path, initial_metadata)
     _atomic_write_text(STATE_DIR / "latest-log-path", str(log_path) + "\n")
 
-    status_read_fd, status_write_fd = os.pipe()
+    stdin_secret_fd: int | None = None
+    if stdin_secret_id is not None:
+        try:
+            stdin_secret_fd = claim_one_time_secret(
+                STATE_DIR,
+                stdin_secret_id,
+                ttl_sec=SECRET_TTL_SEC,
+                max_bytes=MAX_STDIN_SECRET_BYTES,
+            )
+        except Exception as exc:
+            result = RunResult(
+                job_id=job_id,
+                state="spawn_error",
+                exit_code=None,
+                duration_sec=round(time.monotonic() - started_monotonic, 3),
+                started_at_utc=started_at,
+                finished_at_utc=_utc_now(),
+                command_display=command_display,
+                cwd=str(resolved_cwd),
+                log_path=str(log_path),
+                metadata_path=str(metadata_path),
+                output_bytes_seen=0,
+                output_bytes_logged=0,
+                log_truncated=False,
+                stdin_secret_supplied=True,
+                output_suppressed=True,
+                error=f"secret stdin error: {exc}",
+            )
+            _atomic_write_json(metadata_path, {**result.model_dump(), **wake_metadata})
+            if ready_event is not None:
+                ready_event.set()
+            return result
+
+    try:
+        status_read_fd, status_write_fd = os.pipe()
+    except Exception:
+        if stdin_secret_fd is not None:
+            os.close(stdin_secret_fd)
+        raise
     runner_argv = [
         sys.executable,
         "-m",
@@ -1005,6 +1308,7 @@ async def _execute_job(
         str(os.getpid()),
         str(grace_period_sec),
         str(status_write_fd),
+        str(stdin_secret_fd if stdin_secret_fd is not None else -1),
         *validated_argv,
     ]
     try:
@@ -1016,10 +1320,13 @@ async def _execute_job(
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                pass_fds=(status_write_fd,),
+                pass_fds=(status_write_fd,)
+                + ((stdin_secret_fd,) if stdin_secret_fd is not None else ()),
             )
         finally:
             os.close(status_write_fd)
+            if stdin_secret_fd is not None:
+                os.close(stdin_secret_fd)
     except Exception as exc:
         os.close(status_read_fd)
         result = RunResult(
@@ -1036,9 +1343,11 @@ async def _execute_job(
             output_bytes_seen=0,
             output_bytes_logged=0,
             log_truncated=False,
+            stdin_secret_supplied=stdin_secret_supplied,
+            output_suppressed=output_suppressed,
             error=f"spawn error: {type(exc).__name__}: {exc}",
         )
-        _atomic_write_json(metadata_path, result.model_dump())
+        _atomic_write_json(metadata_path, {**result.model_dump(), **wake_metadata})
         if ready_event is not None:
             ready_event.set()
         return result
@@ -1062,6 +1371,7 @@ async def _execute_job(
                     "duration_sec": round(time.monotonic() - started_monotonic, 3),
                     "exit_code": proc.returncode,
                     "error": "cancelled while waiting for supervisor startup",
+                    **wake_metadata,
                 },
             )
             if ready_event is not None:
@@ -1083,9 +1393,11 @@ async def _execute_job(
             output_bytes_seen=0,
             output_bytes_logged=0,
             log_truncated=False,
+            stdin_secret_supplied=stdin_secret_supplied,
+            output_suppressed=output_suppressed,
             error=f"supervisor startup error: {type(exc).__name__}: {exc}",
         )
-        _atomic_write_json(metadata_path, result.model_dump())
+        _atomic_write_json(metadata_path, {**result.model_dump(), **wake_metadata})
         if ready_event is not None:
             ready_event.set()
         return result
@@ -1107,6 +1419,7 @@ async def _execute_job(
         success_contains=success_contains,
         failure_contains=failure_contains,
         last_output_at=started_monotonic,
+        suppress_output=output_suppressed,
     )
     reader_task = asyncio.create_task(_drain_output(proc.stdout, log_path, tracker))
     stop_reason: Literal["timed_out", "inactive_timeout"] | None = None
@@ -1150,6 +1463,7 @@ async def _execute_job(
                     "heartbeat_reports_completed": tracker.heartbeat_reports_completed,
                     "heartbeat_error": tracker.heartbeat_error,
                     "tail_path": str(tail_path),
+                    **wake_metadata,
                 },
             )
         raise
@@ -1176,12 +1490,14 @@ async def _execute_job(
             output_bytes_seen=tracker.bytes_seen,
             output_bytes_logged=tracker.bytes_written,
             log_truncated=tracker.log_truncated,
+            stdin_secret_supplied=stdin_secret_supplied,
+            output_suppressed=output_suppressed,
             success_match=tracker.success_match,
             failure_match=tracker.failure_match,
             error=f"runtime error: {type(exc).__name__}: {exc}",
             tail=_limit_tail(tracker.tail_text, tail_lines, tail_bytes),
         )
-        _atomic_write_json(metadata_path, result.model_dump())
+        _atomic_write_json(metadata_path, {**result.model_dump(), **wake_metadata})
         if ready_event is not None:
             ready_event.set()
         return result
@@ -1210,6 +1526,8 @@ async def _execute_job(
             output_bytes_seen=tracker.bytes_seen,
             output_bytes_logged=tracker.bytes_written,
             log_truncated=tracker.log_truncated,
+            stdin_secret_supplied=stdin_secret_supplied,
+            output_suppressed=output_suppressed,
             success_match=tracker.success_match,
             failure_match=tracker.failure_match,
             tail=_limit_tail(tracker.tail_text, tail_lines, tail_bytes),
@@ -1228,6 +1546,7 @@ async def _execute_job(
                 "forwarded_env_names": initial_metadata["forwarded_env_names"],
                 "heartbeat_reports_completed": tracker.heartbeat_reports_completed,
                 "heartbeat_error": tracker.heartbeat_error,
+                **wake_metadata,
             }
         )
         if cancellation_requested and isinstance(current_metadata, dict):
@@ -1255,6 +1574,17 @@ async def start_job(
         ),
     ],
     cwd: Annotated[str, Field(description="Absolute working directory inside LONGRUN_ALLOWED_ROOTS.")],
+    stdin_secret_id: Annotated[
+        str | None,
+        Field(
+            pattern=r"^[a-f0-9]{32}$",
+            description=(
+                "Optional one-time handle from project_memory_stage_test_asset_for_longrun or "
+                "the codex-longrun-secret fallback. Never pass the password itself. Output is "
+                "suppressed for this job."
+            ),
+        ),
+    ] = None,
     timeout_sec: Annotated[int, Field(ge=1, le=43200)] = 3600,
     no_output_timeout_sec: Annotated[int, Field(ge=0, le=43200)] = 0,
     grace_period_sec: Annotated[int, Field(ge=1, le=120)] = 10,
@@ -1262,8 +1592,18 @@ async def start_job(
     failure_contains: Annotated[str | None, Field(max_length=MAX_MATCH_TEXT_LENGTH)] = None,
     tail_lines: Annotated[int, Field(ge=0, le=200)] = 80,
     tail_bytes: Annotated[int, Field(ge=1024, le=65536)] = 16384,
+    wake_policy: Annotated[
+        WakePolicy,
+        Field(
+            description=(
+                "auto uses a configured Goal bridge when possible; goal requires it; "
+                "none always returns without automatic wakeup."
+            )
+        ),
+    ] = "auto",
+    ctx: Context | None = None,
 ) -> JobStatusResult:
-    """Start one approved job, return promptly, and do not wake Codex automatically."""
+    """Start one approved job and optionally arm event-driven Goal wakeup."""
     job_id = _new_job_id()
     try:
         resolved_cwd = _resolve_cwd(cwd)
@@ -1272,29 +1612,77 @@ async def start_job(
             raise ValueError(f"timeout_sec exceeds configured maximum {MAX_TIMEOUT_SEC}")
         _validate_match_text(success_contains, "success_contains")
         _validate_match_text(failure_contains, "failure_contains")
+        _validate_stdin_secret_id(stdin_secret_id)
+        if stdin_secret_id is not None and (
+            success_contains not in (None, "") or failure_contains not in (None, "")
+        ):
+            raise ValueError(
+                "success_contains and failure_contains are unavailable with secret stdin"
+            )
     except Exception:
         resolved_cwd = None
     if resolved_cwd is not None:
         _reserve_job(job_id, str(resolved_cwd))
 
+    registration: WakeRegistration | None = None
+    wake_delivery: str | None = None
+    if resolved_cwd is not None:
+        try:
+            registration, wake_delivery = await _prepare_wake_registration(
+                job_id=job_id,
+                ctx=ctx,
+                wake_policy=wake_policy,
+                timeout_sec=timeout_sec,
+                grace_period_sec=grace_period_sec,
+            )
+        except Exception as exc:
+            _update_job_metadata(
+                job_id,
+                state="spawn_error",
+                finished_at_utc=_utc_now(),
+                automatic_wakeup=False,
+                wake_policy=wake_policy,
+                wake_delivery="setup_failed",
+                error=f"Goal wakeup setup failed before command start: {exc}",
+            )
+            raise
+
+    wake_metadata: dict[str, object] = {
+        "automatic_wakeup": registration is not None,
+        "wake_policy": wake_policy,
+    }
+    if wake_delivery is not None:
+        wake_metadata["wake_delivery"] = wake_delivery
+    if registration is not None:
+        wake_metadata["wake_thread_id"] = registration.thread_id
+    if resolved_cwd is not None:
+        _update_job_metadata(job_id, **wake_metadata)
+
     ready_event = asyncio.Event()
-    task = asyncio.create_task(
-        _execute_job(
-            job_id,
-            argv,
-            cwd,
-            timeout_sec,
-            no_output_timeout_sec,
-            grace_period_sec,
-            success_contains,
-            failure_contains,
-            tail_lines,
-            tail_bytes,
-            None,
-            ready_event,
-        ),
-        name=f"codex-longrun-{job_id}",
-    )
+    try:
+        task = asyncio.create_task(
+            _run_background_job(
+                job_id,
+                argv,
+                cwd,
+                timeout_sec,
+                no_output_timeout_sec,
+                grace_period_sec,
+                success_contains,
+                failure_contains,
+                tail_lines,
+                tail_bytes,
+                ready_event,
+                registration,
+                wake_metadata,
+                stdin_secret_id,
+            ),
+            name=f"codex-longrun-{job_id}",
+        )
+    except Exception:
+        if registration is not None:
+            await _abort_wake_registration(job_id, registration)
+        raise
     _BACKGROUND_JOBS[job_id] = task
     task.add_done_callback(lambda completed, jid=job_id: _consume_background_result(jid, completed))
     try:
@@ -1385,6 +1773,17 @@ async def run_and_wait(
         ),
     ],
     cwd: Annotated[str, Field(description="Absolute working directory inside LONGRUN_ALLOWED_ROOTS.")],
+    stdin_secret_id: Annotated[
+        str | None,
+        Field(
+            pattern=r"^[a-f0-9]{32}$",
+            description=(
+                "Optional one-time handle from project_memory_stage_test_asset_for_longrun or "
+                "the codex-longrun-secret fallback. Never pass the password itself. Output is "
+                "suppressed for this job."
+            ),
+        ),
+    ] = None,
     timeout_sec: Annotated[int, Field(ge=1, le=43200)] = 3600,
     no_output_timeout_sec: Annotated[int, Field(ge=0, le=43200)] = 0,
     grace_period_sec: Annotated[int, Field(ge=1, le=120)] = 10,
@@ -1412,6 +1811,7 @@ async def run_and_wait(
         tail_lines,
         tail_bytes,
         ctx,
+        stdin_secret_id=stdin_secret_id,
     )
 
 
@@ -1428,7 +1828,13 @@ async def read_log_tail(
     _ensure_state_dirs()
     if not JOB_ID_RE.fullmatch(job_id):
         raise ValueError("invalid job_id")
-    _read_job_metadata(job_id)
+    payload = _read_job_metadata(job_id)
+    if bool(payload.get("output_suppressed", False)):
+        return LogTailResult(
+            job_id=job_id,
+            source_path=str(JOBS_DIR / f"{job_id}.log"),
+            tail="",
+        )
     tail_path = JOBS_DIR / f"{job_id}.tail.txt"
     log_path = JOBS_DIR / f"{job_id}.log"
     source = tail_path if tail_path.is_file() else log_path

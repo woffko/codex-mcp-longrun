@@ -16,11 +16,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-DEFAULT_TOOLS = ["health", "start_job", "get_job", "cancel_job", "read_log_tail"]
+DEFAULT_TOOLS = ["health", "start_job", "get_job", "cancel_job", "run_and_wait", "read_log_tail"]
 TOOL_APPROVALS = {
     "start_job": "prompt",
     "get_job": "auto",
     "cancel_job": "prompt",
+    "run_and_wait": "prompt",
+    "read_log_tail": "prompt",
 }
 
 
@@ -129,8 +131,20 @@ def main() -> None:
         raise SystemExit(f"mcp_servers.{args.server_name} is not a configured STDIO server") from exc
     if not isinstance(server, dict) or not isinstance(env, dict):
         raise SystemExit(f"mcp_servers.{args.server_name} has an invalid structure")
+    env_vars = server.get("env_vars", [])
+    if not isinstance(env_vars, list) or not all(isinstance(item, str) for item in env_vars):
+        raise SystemExit(f"mcp_servers.{args.server_name}.env_vars must be a string array")
+    upgraded_env_vars = [*env_vars]
+    if "LONGRUN_BRIDGE_SOCKET" not in upgraded_env_vars:
+        upgraded_env_vars.append("LONGRUN_BRIDGE_SOCKET")
 
     updated = _set_assignment(original, f"mcp_servers.{args.server_name}", "enabled_tools", DEFAULT_TOOLS)
+    updated = _set_assignment(
+        updated,
+        f"mcp_servers.{args.server_name}",
+        "env_vars",
+        upgraded_env_vars,
+    )
     updated = _set_assignment(
         updated,
         f"mcp_servers.{args.server_name}.env",
@@ -145,6 +159,20 @@ def main() -> None:
         "4",
         preserve_existing=True,
     )
+    updated = _set_assignment(
+        updated,
+        f"mcp_servers.{args.server_name}.env",
+        "LONGRUN_SECRET_TTL_SEC",
+        "300",
+        preserve_existing=True,
+    )
+    updated = _set_assignment(
+        updated,
+        f"mcp_servers.{args.server_name}.env",
+        "LONGRUN_MAX_STDIN_SECRET_BYTES",
+        "65536",
+        preserve_existing=True,
+    )
     for tool, approval in TOOL_APPROVALS.items():
         updated = _ensure_tool_section(updated, args.server_name, tool, approval)
 
@@ -152,10 +180,13 @@ def main() -> None:
     expected = copy.deepcopy(parsed)
     expected_server = expected["mcp_servers"][args.server_name]
     expected_server["enabled_tools"] = DEFAULT_TOOLS
+    expected_server["env_vars"] = upgraded_env_vars
     expected_env = expected_server["env"]
     if "LONGRUN_HEARTBEAT_INITIAL_SEC" not in expected_env or args.reset_heartbeat:
         expected_env["LONGRUN_HEARTBEAT_INITIAL_SEC"] = "0"
     expected_env.setdefault("LONGRUN_MAX_ACTIVE_JOBS", "4")
+    expected_env.setdefault("LONGRUN_SECRET_TTL_SEC", "300")
+    expected_env.setdefault("LONGRUN_MAX_STDIN_SECRET_BYTES", "65536")
     expected_tools = expected_server.setdefault("tools", {})
     for tool, approval in TOOL_APPROVALS.items():
         expected_tools.setdefault(tool, {"approval_mode": approval})
@@ -167,7 +198,7 @@ def main() -> None:
         return
     if args.dry_run:
         print("Dry run; config unchanged.")
-        print("Would enable asynchronous longrun job tools and preserve unrelated settings.")
+        print("Would enable longrun tools and bridge passthrough while preserving unrelated settings.")
         return
 
     backup_path = _write_config(config_path, updated)

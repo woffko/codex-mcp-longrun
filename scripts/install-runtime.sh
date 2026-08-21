@@ -18,3 +18,7 @@ UV_PROJECT_ENVIRONMENT="$runtime_root" \
 uv pip check --python "$runtime_root/bin/python"
 printf 'Installed runtime: %s\n' "$runtime_root"
 printf 'Server command: %s\n' "$runtime_root/bin/codex-mcp-longrun"
+printf 'Bridge launcher: %s\n' "$runtime_root/bin/codex-longrun"
+printf 'Bridge service: %s\n' "$runtime_root/bin/codex-longrun-bridge"
+printf 'TUI proxy service: %s\n' "$runtime_root/bin/codex-longrun-tui-proxy"
+printf 'Secret stdin helper: %s\n' "$runtime_root/bin/codex-longrun-secret"
