@@ -77,6 +77,54 @@ async def _terminate(process: asyncio.subprocess.Process | None) -> None:
         await process.wait()
 
 
+def _guarded_exec_command(*command: str) -> tuple[str, ...]:
+    """Exec an interactive child with kernel parent-death delivery."""
+
+    return (
+        sys.executable,
+        "-m",
+        "codex_mcp_longrun.parent_guard",
+        "--parent-pid",
+        str(os.getpid()),
+        "--exec-only",
+        "--",
+        *command,
+    )
+
+
+async def _spawn_supervised_daemon(
+    *command: str,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[asyncio.subprocess.Process, int]:
+    """Start a daemon guard isolated from the launcher's terminal group."""
+
+    parent_fd, launcher_fd = os.pipe()
+    try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "codex_mcp_longrun.parent_guard",
+            "--parent-pid",
+            str(os.getpid()),
+            "--parent-fd",
+            str(parent_fd),
+            "--",
+            *command,
+            cwd=cwd,
+            env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            pass_fds=(parent_fd,),
+            start_new_session=True,
+        )
+    except BaseException:
+        os.close(launcher_fd)
+        raise
+    finally:
+        os.close(parent_fd)
+    return process, launcher_fd
+
+
 def _resolve_codex_cwd(
     codex_args: list[str], invocation_cwd: Path | None = None
 ) -> Path:
@@ -130,10 +178,11 @@ async def _run(codex_args: list[str], options: LauncherOptions) -> int:
     bridge_process: asyncio.subprocess.Process | None = None
     proxy_process: asyncio.subprocess.Process | None = None
     tui_process: asyncio.subprocess.Process | None = None
+    guard_launcher_fds: list[int] = []
     try:
         app_env = dict(os.environ)
         app_env["LONGRUN_BRIDGE_SOCKET"] = str(bridge_socket)
-        app_process = await asyncio.create_subprocess_exec(
+        app_process, app_guard_fd = await _spawn_supervised_daemon(
             codex,
             "app-server",
             "--listen",
@@ -141,9 +190,10 @@ async def _run(codex_args: list[str], options: LauncherOptions) -> int:
             cwd=str(codex_cwd),
             env=app_env,
         )
+        guard_launcher_fds.append(app_guard_fd)
         await _wait_for_socket(app_socket, app_process, "Codex App Server")
 
-        bridge_process = await asyncio.create_subprocess_exec(
+        bridge_process, bridge_guard_fd = await _spawn_supervised_daemon(
             sys.executable,
             "-m",
             "codex_mcp_longrun.bridge",
@@ -154,9 +204,10 @@ async def _run(codex_args: list[str], options: LauncherOptions) -> int:
             "--state-db",
             str(state_db),
         )
+        guard_launcher_fds.append(bridge_guard_fd)
         await _wait_for_socket(bridge_socket, bridge_process, "codex-longrun bridge")
 
-        proxy_process = await asyncio.create_subprocess_exec(
+        proxy_process, proxy_guard_fd = await _spawn_supervised_daemon(
             sys.executable,
             "-m",
             "codex_mcp_longrun.tui_proxy",
@@ -173,13 +224,16 @@ async def _run(codex_args: list[str], options: LauncherOptions) -> int:
             "--helper-timeout-sec",
             str(options.helper_timeout_sec),
         )
+        guard_launcher_fds.append(proxy_guard_fd)
         await _wait_for_socket(tui_socket, proxy_process, "codex-longrun TUI proxy")
 
         tui_process = await asyncio.create_subprocess_exec(
-            codex,
-            "--remote",
-            f"unix://{tui_socket}",
-            *codex_args,
+            *_guarded_exec_command(
+                codex,
+                "--remote",
+                f"unix://{tui_socket}",
+                *codex_args,
+            ),
             cwd=str(codex_cwd),
         )
         tui_wait = asyncio.create_task(tui_process.wait())
@@ -207,6 +261,9 @@ async def _run(codex_args: list[str], options: LauncherOptions) -> int:
         await _terminate(proxy_process)
         await _terminate(bridge_process)
         await _terminate(app_process)
+        for guard_fd in guard_launcher_fds:
+            with contextlib.suppress(OSError):
+                os.close(guard_fd)
         # The target is the exact private directory returned by mkdtemp.
         shutil.rmtree(runtime_dir, ignore_errors=True)
 

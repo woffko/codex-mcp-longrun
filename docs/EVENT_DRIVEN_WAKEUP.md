@@ -22,6 +22,14 @@ global MCP registration names that variable in `env_vars`, so only the MCP
 server spawned under this launcher receives the private bridge endpoint.
 Ordinary Codex processes do not create the variable and keep manual behavior.
 
+App Server, the bridge, and the proxy each run below an isolated Linux/WSL
+supervisor. The supervisor arms `PR_SET_PDEATHSIG=SIGTERM`, rechecks the
+expected launcher PPID, and watches a launcher-owned pipe for EOF. Parent loss
+therefore triggers a bounded `SIGTERM` then `SIGKILL` sweep of the daemon's
+complete process group, including wrapper descendants. The interactive TUI
+keeps its controlling terminal and uses a direct exec guard instead. This
+prevents an orphaned native App Server from retaining a thread writer lock.
+
 The TUI proxy is not part of Goal delivery. It transparently relays the
 bidirectional App Server protocol, including approvals and notifications. Its
 only compatibility intervention is a large Legacy

@@ -260,6 +260,16 @@ The server is configured but missing from a resumed session:
 - exit the old Codex process completely;
 - resume from a new process instead of continuing the already running client.
 
+Resume reports `thread-store conflict` or `already has an active writer`:
+
+- do not delete, migrate, or fork the session merely to bypass the lock;
+- first check whether the same session is still open in another TUI;
+- if a terminal was lost, inspect the exact launcher's App Server and active
+  Longrun jobs before terminating anything;
+- upgrade to `0.4.0a7` or newer. Its isolated supervisors terminate complete
+  daemon process groups when the launcher disappears, preventing a stale App
+  Server writer lock after future terminal loss.
+
 `run_and_wait` exists on the server but is missing from a session:
 
 - confirm `codex mcp get longrun` lists it in `enabled_tools`;

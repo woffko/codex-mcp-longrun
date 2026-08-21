@@ -28,7 +28,7 @@ The project is currently a Linux/WSL pilot, not a production release.
 
 > [!IMPORTANT]
 > This README describes the `experimental` branch and package version
-> `0.4.0a6`. Its recommended Goal workflow is `codex-longrun` plus
+> `0.4.0a7`. Its recommended Goal workflow is `codex-longrun` plus
 > `start_job(wake_policy="goal")`. The manual Goal and blocking workflows are
 > compatibility fallbacks and must not be combined with automatic wakeup.
 
@@ -253,6 +253,15 @@ The launcher resolves Codex `-C`/`--cd` before starting App Server and starts
 both App Server and the remote TUI with that real process working directory.
 This ensures that project-scoped `.codex/config.toml` is loaded even when
 `codex-longrun` itself was invoked from another directory.
+
+On Linux/WSL, App Server, the Goal bridge, and the TUI proxy run below isolated
+supervisors. Each supervisor combines kernel parent-death delivery with a
+launcher-owned pipe, then terminates the daemon's complete process group with
+`SIGTERM` and bounded `SIGKILL` escalation. The interactive TUI keeps its
+controlling terminal and uses a lighter exec guard. Every guard rechecks PPID
+after arming to close the fork-to-arm race. This prevents a Node shim or native
+App Server from surviving its launcher and retaining a thread-store writer
+lock; normal exits still use the launcher's graceful `finally` cleanup first.
 
 ### Large Legacy session compatibility
 
