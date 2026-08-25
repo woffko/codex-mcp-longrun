@@ -18,6 +18,7 @@ from codex_mcp_longrun.launcher import (
     _guarded_exec_command,
     _parse_args,
     _resolve_codex_cwd,
+    _runtime_parent,
 )
 
 
@@ -64,6 +65,22 @@ def _wait_for(predicate: Callable[[], bool], timeout_sec: float = 10.0) -> bool:
 
 
 class LauncherArgumentTests(unittest.TestCase):
+    def test_missing_configured_runtime_parent_falls_back_to_tmp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing-runtime"
+            with patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(missing)}):
+                runtime_parent = _runtime_parent()
+
+        self.assertEqual(runtime_parent, Path("/tmp").resolve())
+
+    def test_existing_unsafe_runtime_parent_is_still_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_parent = Path(directory) / "runtime"
+            runtime_parent.mkdir(mode=0o755)
+            with patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(runtime_parent)}):
+                with self.assertRaisesRegex(RuntimeError, "not private and same-user owned"):
+                    _runtime_parent()
+
     def test_proxy_options_are_consumed_and_codex_arguments_are_preserved(self) -> None:
         argv = [
             "codex-longrun",

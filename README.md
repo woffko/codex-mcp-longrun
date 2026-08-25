@@ -28,7 +28,7 @@ The project is currently a Linux/WSL pilot, not a production release.
 
 > [!IMPORTANT]
 > This README describes the `experimental` branch and package version
-> `0.4.0a7`. Its recommended Goal workflow is `codex-longrun` plus
+> `0.4.0a8`. Its recommended Goal workflow is `codex-longrun` plus
 > `start_job(wake_policy="goal")`. The manual Goal and blocking workflows are
 > compatibility fallbacks and must not be combined with automatic wakeup.
 
@@ -262,6 +262,12 @@ controlling terminal and uses a lighter exec guard. Every guard rechecks PPID
 after arming to close the fork-to-arm race. This prevents a Node shim or native
 App Server from surviving its launcher and retaining a thread-store writer
 lock; normal exits still use the launcher's graceful `finally` cleanup first.
+
+The launcher prefers `XDG_RUNTIME_DIR` for its private socket directory. If the
+variable is unset or points to a nonexistent stale path, as can happen in a WSL
+shell that was not registered as a logind session, it safely falls back to a
+fresh mode-`0700` directory under `/tmp`. An existing configured runtime
+directory is still rejected unless it is private and owned by the current user.
 
 ### Large Legacy session compatibility
 

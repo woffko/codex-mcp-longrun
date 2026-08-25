@@ -30,6 +30,9 @@ def _runtime_parent() -> Path:
     candidate = Path(configured).expanduser() if configured else Path("/tmp")
     candidate = candidate.resolve()
     if not candidate.is_dir():
+        fallback = Path("/tmp").resolve()
+        if configured and not candidate.exists() and fallback.is_dir():
+            return fallback
         raise RuntimeError(f"runtime parent does not exist: {candidate}")
     info = candidate.stat()
     if configured and (info.st_uid != os.getuid() or info.st_mode & 0o077):
