@@ -340,6 +340,13 @@ automatically; resume the Goal manually in that case.
 
 ### Copy-paste automatic Goal contract
 
+For execution instructions in new Goals and existing sessions, use the
+[durable Goal contract](docs/GOAL_LONGRUN_CONTRACT.md). It requires a live Goal
+and a configured bridge before submission, explicitly rules out `auto`/`none`
+fallbacks for automatic execution, and explains how to attach instructions to
+an existing session without replacing its Goal or invalidating a pending wake
+lease. Replacing a Goal objective resets its usage accounting.
+
 Replace the placeholders and start Codex through `codex-longrun` first:
 
 ```text
