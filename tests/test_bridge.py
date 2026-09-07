@@ -173,6 +173,51 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(status_sets, ["paused"])
 
+    async def test_manual_goal_pause_after_bridge_pause_abandons_lease(self) -> None:
+        job_id = uuid.uuid4().hex
+        await self.bridge._dispatch(
+            {
+                "version": 1,
+                "action": "prepare",
+                "job_id": job_id,
+                "thread_id": self.thread_id,
+                "timeout_sec": 60,
+                "grace_period_sec": 5,
+            }
+        )
+        bridge_pause_revision = dict(self.fake.goal)
+        await self.bridge._on_notification(
+            "thread/goal/updated",
+            {"threadId": self.thread_id, "goal": bridge_pause_revision},
+        )
+
+        # The user pauses the Goal again. It has the same status but a newer
+        # revision, so the bridge must abandon automatic wakeup.
+        self.fake.goal["updatedAt"] += 1
+        await self.bridge._on_notification(
+            "thread/goal/updated", {"threadId": self.thread_id, "goal": dict(self.fake.goal)}
+        )
+        lease = self.bridge.state.get(job_id)
+        assert lease is not None
+        self.assertEqual(lease.delivery_state, "abandoned")
+
+        result = await self.bridge._dispatch(
+            {
+                "version": 1,
+                "action": "terminal",
+                "job_id": job_id,
+                "thread_id": self.thread_id,
+                "terminal_state": "succeeded",
+            }
+        )
+        self.assertTrue(result["idempotent"])
+        status_sets = [
+            params["status"]
+            for method, params in self.fake.calls
+            if method == "thread/goal/set"
+        ]
+        self.assertEqual(status_sets, ["paused"])
+
 
 class BridgeSocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_private_socket_and_app_server_jsonrpc_round_trip(self) -> None:
