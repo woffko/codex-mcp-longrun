@@ -178,7 +178,6 @@ async def _run(codex_args: list[str], options: LauncherOptions) -> int:
         raise RuntimeError("runtime path is too long for Unix-domain sockets")
 
     app_process: asyncio.subprocess.Process | None = None
-    bridge_process: asyncio.subprocess.Process | None = None
     proxy_process: asyncio.subprocess.Process | None = None
     tui_process: asyncio.subprocess.Process | None = None
     guard_launcher_fds: list[int] = []
@@ -196,26 +195,16 @@ async def _run(codex_args: list[str], options: LauncherOptions) -> int:
         guard_launcher_fds.append(app_guard_fd)
         await _wait_for_socket(app_socket, app_process, "Codex App Server")
 
-        bridge_process, bridge_guard_fd = await _spawn_supervised_daemon(
+        proxy_process, proxy_guard_fd = await _spawn_supervised_daemon(
             sys.executable,
             "-m",
-            "codex_mcp_longrun.bridge",
+            "codex_mcp_longrun.coordinator",
             "--app-server-socket",
             str(app_socket),
             "--bridge-socket",
             str(bridge_socket),
             "--state-db",
             str(state_db),
-        )
-        guard_launcher_fds.append(bridge_guard_fd)
-        await _wait_for_socket(bridge_socket, bridge_process, "codex-longrun bridge")
-
-        proxy_process, proxy_guard_fd = await _spawn_supervised_daemon(
-            sys.executable,
-            "-m",
-            "codex_mcp_longrun.tui_proxy",
-            "--app-server-socket",
-            str(app_socket),
             "--tui-socket",
             str(tui_socket),
             "--legacy-history-mode",
@@ -228,6 +217,7 @@ async def _run(codex_args: list[str], options: LauncherOptions) -> int:
             str(options.helper_timeout_sec),
         )
         guard_launcher_fds.append(proxy_guard_fd)
+        await _wait_for_socket(bridge_socket, proxy_process, "codex-longrun bridge")
         await _wait_for_socket(tui_socket, proxy_process, "codex-longrun TUI proxy")
 
         tui_process = await asyncio.create_subprocess_exec(
@@ -241,9 +231,8 @@ async def _run(codex_args: list[str], options: LauncherOptions) -> int:
         )
         tui_wait = asyncio.create_task(tui_process.wait())
         proxy_wait = asyncio.create_task(proxy_process.wait())
-        bridge_wait = asyncio.create_task(bridge_process.wait())
         app_wait = asyncio.create_task(app_process.wait())
-        waits = {tui_wait, proxy_wait, bridge_wait, app_wait}
+        waits = {tui_wait, proxy_wait, app_wait}
         done, pending = await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
@@ -256,13 +245,10 @@ async def _run(codex_args: list[str], options: LauncherOptions) -> int:
             raise RuntimeError(
                 f"TUI compatibility proxy exited unexpectedly with code {proxy_wait.result()}"
             )
-        if bridge_wait in done:
-            raise RuntimeError(f"Goal bridge exited unexpectedly with code {bridge_wait.result()}")
         raise RuntimeError(f"Codex App Server exited unexpectedly with code {app_wait.result()}")
     finally:
         await _terminate(tui_process)
         await _terminate(proxy_process)
-        await _terminate(bridge_process)
         await _terminate(app_process)
         for guard_fd in guard_launcher_fds:
             with contextlib.suppress(OSError):

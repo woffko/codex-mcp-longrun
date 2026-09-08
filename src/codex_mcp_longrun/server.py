@@ -44,7 +44,7 @@ from .secret_input import (
 
 
 SERVER_NAME = "Codex MCP Longrun"
-SERVER_VERSION = "0.4.0a9"
+SERVER_VERSION = "0.4.0a10"
 DEFAULT_MAX_LOG_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_TIMEOUT_SEC = 12 * 60 * 60
 DEFAULT_HEARTBEAT_INITIAL_SEC = 0
@@ -344,7 +344,14 @@ MCP_INSTRUCTIONS = (
     "write_stdin, log-tail tools, or polling in that submission turn. In the automatically resumed "
     "turn, call get_job exactly once. Use wake_policy='none' only with ordinary Codex or an explicit "
     "manual fallback; then end the turn without waiting and use get_job only in a later user-resumed "
-    "turn. When automatic_wakeup is false, do not claim wakeup. cancel_job requires "
+    "turn. When automatic_wakeup is false, do not claim wakeup. Without a pending Goal, the updated "
+    "codex-longrun coordinator supports wake_policy='session' (or auto). It holds start_job while the "
+    "bridge interrupts the originating turn and records a durable startup receipt. An aborted outer "
+    "tool after that receipt does not mean startup failed; never duplicate the job. Invoke start_job "
+    "in its own functions.exec call, with no parallel or following work. The terminal event starts one "
+    "continuation in the same session; get_job once and continue the task. New user input or stop "
+    "cancels pending session wakeup without killing the job. Paused, blocked, and limited Goals are "
+    "never bypassed. cancel_wakeup cancels only a session wake; cancel_job requires "
     "approval. run_and_wait is a legacy "
     "compatibility tool because some Codex runtimes turn a pending tool call into model-driven waits. "
     "Pass argv as an array and cwd as an absolute path. Never place a secret value in argv, MCP arguments, "
@@ -385,6 +392,9 @@ class HealthResult(BaseModel):
     heartbeat_interval_sec: int
     recovered_orphan_jobs: int
     bridge_configured: bool
+    bridge_reachable: bool = False
+    session_wakeup_supported: bool = False
+    session_transport_ready: bool = False
     secret_stdin_supported: bool
     secret_stdin_pair_supported: bool
     secret_ttl_sec: int
@@ -450,6 +460,9 @@ class JobStatusResult(BaseModel):
     terminal: bool
     automatic_wakeup: bool = False
     wake_delivery: str | None = None
+    wake_mode: str | None = None
+    handoff_state: str | None = None
+    wake_error: str | None = None
     recommended_check_after_sec: int | None = None
     exit_code: int | None = None
     duration_sec: float
@@ -522,13 +535,15 @@ TERMINAL_JOB_STATES = {
 _BACKGROUND_JOBS: dict[str, asyncio.Task[RunResult]] = {}
 
 
-WakePolicy = Literal["auto", "goal", "none"]
+WakePolicy = Literal["auto", "goal", "session", "none"]
+_HANDOFF_TASKS: dict[str, asyncio.Task[None]] = {}
 
 
 @dataclass(frozen=True)
 class WakeRegistration:
     socket_path: str
     thread_id: str
+    wake_mode: str = "goal"
 
 
 def _thread_id_from_context(ctx: Context | None) -> str | None:
@@ -606,6 +621,9 @@ def _job_status_from_payload(
         state=state,  # type: ignore[arg-type]
         terminal=terminal,
         automatic_wakeup=bool(payload.get("automatic_wakeup", False)),
+        wake_mode=payload.get("wake_mode") if isinstance(payload.get("wake_mode"), str) else None,
+        handoff_state=payload.get("handoff_state") if isinstance(payload.get("handoff_state"), str) else None,
+        wake_error=payload.get("wake_error") if isinstance(payload.get("wake_error"), str) else None,
         wake_delivery=(
             str(payload["wake_delivery"]) if isinstance(payload.get("wake_delivery"), str) else None
         ),
@@ -693,11 +711,17 @@ async def _prepare_wake_registration(
         return None, None
     thread_id = _thread_id_from_context(ctx)
     if not BRIDGE_SOCKET or thread_id is None:
-        if wake_policy == "goal":
+        if wake_policy in {"goal", "session"}:
             missing = "bridge socket" if not BRIDGE_SOCKET else "trusted Codex thread metadata"
-            raise RuntimeError(f"Goal wakeup requested but {missing} is unavailable")
+            raise RuntimeError(f"{wake_policy} wakeup requested but {missing} is unavailable")
         return None, "bridge_unavailable"
     try:
+        meta = ctx.request_context.meta if ctx is not None else {}
+        call_id = meta.get("callId") if isinstance(meta, dict) else None
+        if wake_policy == "session":
+            health = await request_bridge(BRIDGE_SOCKET, {"action": "health"})
+            if health.get("session_wakeup_supported") is not True:
+                raise BridgeError("bridge does not support session handoff; restart with the updated codex-longrun launcher")
         response = await request_bridge(
             BRIDGE_SOCKET,
             {
@@ -706,6 +730,8 @@ async def _prepare_wake_registration(
                 "thread_id": thread_id,
                 "timeout_sec": timeout_sec,
                 "grace_period_sec": grace_period_sec,
+                "wake_policy": wake_policy,
+                "call_id": call_id,
             },
         )
     except BridgeError as exc:
@@ -723,14 +749,38 @@ async def _prepare_wake_registration(
             )
         except BridgeError:
             pass
-        if wake_policy == "goal":
-            raise RuntimeError(f"Goal wakeup setup failed: {exc}") from exc
-        return None, "bridge_rejected"
+        raise RuntimeError(f"Automatic wakeup setup failed: {exc}") from exc
     if response.get("automatic_wakeup") is not True:
-        if wake_policy == "goal":
-            raise RuntimeError("Goal bridge did not confirm automatic wakeup")
-        return None, "bridge_not_armed"
-    return WakeRegistration(socket_path=BRIDGE_SOCKET, thread_id=thread_id), "armed"
+        raise RuntimeError("Bridge did not confirm automatic wakeup")
+    mode = response.get("wake_mode", "goal")
+    if mode not in {"session", "goal"} or (wake_policy == "session" and mode != "session"):
+        raise RuntimeError("Bridge returned an incompatible wake mode")
+    return WakeRegistration(socket_path=BRIDGE_SOCKET, thread_id=thread_id, wake_mode=mode), "armed"
+
+
+async def _session_handoff(job_id: str, registration: WakeRegistration) -> None:
+    """Independent of cancellation of the held MCP request and of the job task."""
+    try:
+        payload = _read_job_metadata(job_id)
+        response = await request_bridge(registration.socket_path, {
+            "action": "handoff", "job_id": job_id, "thread_id": registration.thread_id,
+            "job_state": str(payload.get("state", "spawn_error")),
+        }, timeout_sec=20)
+        if response.get("handoff") != "complete":
+            raise BridgeError("bridge did not confirm session handoff")
+        _update_job_metadata(job_id, handoff_state="complete")
+    except Exception as exc:
+        await _abort_wake_registration(job_id, registration)
+        _update_job_metadata(job_id, handoff_state="failed", automatic_wakeup=False,
+                             wake_error=f"session handoff failed: {type(exc).__name__}: {exc}")
+        raise RuntimeError(f"Job {job_id} was already started but session handoff failed: {exc}. "
+                           "Do not launch a duplicate; inspect this job with get_job.") from exc
+
+
+def _handoff_finished(job_id: str, task: asyncio.Task[None]) -> None:
+    _HANDOFF_TASKS.pop(job_id, None)
+    if not task.cancelled():
+        task.exception()  # Retrieved here; the RPC waiter also observes any error.
 
 
 async def _abort_wake_registration(job_id: str, registration: WakeRegistration) -> None:
@@ -766,10 +816,10 @@ async def _deliver_terminal_wakeup(job_id: str, registration: WakeRegistration) 
             },
         )
         delivery = response.get("delivery_state")
-        _update_job_metadata(
-            job_id,
-            wake_delivery=str(delivery) if isinstance(delivery, str) else "accepted",
-        )
+        fields: dict[str, object] = {"wake_delivery": str(delivery) if isinstance(delivery, str) else "accepted"}
+        if delivery in {"abandoned", "needs_manual_recovery"}:
+            fields["automatic_wakeup"] = False
+        _update_job_metadata(job_id, **fields)
     except BridgeError as exc:
         _update_job_metadata(
             job_id,
@@ -1173,6 +1223,12 @@ def _result_state(
 async def health() -> HealthResult:
     """Return server paths, versions, and configured guardrails."""
     _ensure_state_dirs()
+    bridge_health: dict[str, object] = {}
+    if BRIDGE_SOCKET:
+        try:
+            bridge_health = await request_bridge(BRIDGE_SOCKET, {"action": "health"}, timeout_sec=2)
+        except BridgeError:
+            pass
     return HealthResult(
         ok=True,
         server_version=SERVER_VERSION,
@@ -1189,6 +1245,9 @@ async def health() -> HealthResult:
         heartbeat_interval_sec=HEARTBEAT_INTERVAL_SEC,
         recovered_orphan_jobs=RECOVERED_ORPHAN_JOBS,
         bridge_configured=bool(BRIDGE_SOCKET),
+        bridge_reachable=bridge_health.get("ok") is True,
+        session_wakeup_supported=bridge_health.get("session_wakeup_supported") is True,
+        session_transport_ready=bridge_health.get("session_transport_ready") is True,
         secret_stdin_supported=True,
         secret_stdin_pair_supported=hasattr(os, "memfd_create"),
         secret_ttl_sec=SECRET_TTL_SEC,
@@ -1576,6 +1635,10 @@ async def _execute_job(
         )
         if cancellation_requested and isinstance(current_metadata, dict):
             metadata["cancel_requested_at_utc"] = current_metadata["cancel_requested_at_utc"]
+        if isinstance(current_metadata, dict):
+            for key in ("automatic_wakeup", "wake_delivery", "wake_mode", "handoff_state", "wake_error"):
+                if key in current_metadata:
+                    metadata[key] = current_metadata[key]
         _atomic_write_json(metadata_path, metadata)
     return result
 
@@ -1621,8 +1684,9 @@ async def start_job(
         WakePolicy,
         Field(
             description=(
-                "auto uses a configured Goal bridge when possible; goal requires it; "
-                "none always returns without automatic wakeup."
+                "auto selects Goal or session continuation with a configured bridge; goal requires an active Goal; "
+                "session requires the codex-longrun coordinator and yields by interrupting this tool transport "
+                "after a durable startup receipt. none returns without automatic wakeup."
             )
         ),
     ] = "auto",
@@ -1636,7 +1700,7 @@ async def start_job(
         )),
     ] = None,
 ) -> JobStatusResult:
-    """Start one approved job and optionally arm event-driven Goal wakeup."""
+    """Start one approved job and arm Goal or session continuation when requested."""
     job_id = _new_job_id()
     try:
         resolved_cwd = _resolve_cwd(cwd)
@@ -1672,7 +1736,7 @@ async def start_job(
                 automatic_wakeup=False,
                 wake_policy=wake_policy,
                 wake_delivery="setup_failed",
-                error=f"Goal wakeup setup failed before command start: {exc}",
+                error=f"Automatic wakeup setup failed before command start: {exc}",
             )
             raise
 
@@ -1684,6 +1748,7 @@ async def start_job(
         wake_metadata["wake_delivery"] = wake_delivery
     if registration is not None:
         wake_metadata["wake_thread_id"] = registration.thread_id
+        wake_metadata["wake_mode"] = registration.wake_mode
     if resolved_cwd is not None:
         _update_job_metadata(job_id, **wake_metadata)
 
@@ -1719,6 +1784,13 @@ async def start_job(
         await asyncio.wait_for(ready_event.wait(), timeout=3.0)
     except asyncio.TimeoutError:
         pass
+    if registration is not None and registration.wake_mode == "session":
+        # Do not return to code mode/the model before the originating turn stops.
+        # Shield only handoff delivery; the background job already has its own task.
+        handoff = asyncio.create_task(_session_handoff(job_id, registration), name=f"session-handoff-{job_id}")
+        _HANDOFF_TASKS[job_id] = handoff
+        handoff.add_done_callback(lambda task, jid=job_id: _handoff_finished(jid, task))
+        await asyncio.shield(handoff)
     return _job_status_from_payload(_read_job_metadata(job_id), tail_lines=tail_lines, tail_bytes=tail_bytes)
 
 
@@ -1732,11 +1804,44 @@ async def get_job(
     tail_bytes: Annotated[int, Field(ge=1024, le=65536)] = 16384,
 ) -> JobStatusResult:
     """Read a job once; do not repeatedly poll a running job in the same turn."""
+    payload = _read_job_metadata(job_id)
+    if payload.get("wake_mode") == "session" and BRIDGE_SOCKET:
+        try:
+            wake = await request_bridge(BRIDGE_SOCKET, {"action": "wake_status", "job_id": job_id,
+                                                       "thread_id": payload.get("wake_thread_id")}, timeout_sec=2)
+            fields: dict[str, object] = {"wake_delivery": wake.get("delivery_state")}
+            if wake.get("delivery_state") in {"abandoned", "needs_manual_recovery"}:
+                fields.update(automatic_wakeup=False, wake_error=wake.get("error"))
+            _update_job_metadata(job_id, **fields)
+        except BridgeError:
+            pass  # The job result remains available when its coordinator is offline.
     return _job_status_from_payload(
         _read_job_metadata(job_id),
         tail_lines=tail_lines,
         tail_bytes=tail_bytes,
     )
+
+
+@mcp.tool(
+    title="Cancel one pending session wakeup without stopping its job",
+    annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False),
+)
+async def cancel_wakeup(
+    job_id: Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")],
+    ctx: Context | None = None,
+) -> dict[str, object]:
+    """Cancel only this thread's session continuation when the user requests it."""
+    thread_id = _thread_id_from_context(ctx)
+    payload = _read_job_metadata(job_id)
+    if not BRIDGE_SOCKET or thread_id is None or payload.get("wake_thread_id") != thread_id:
+        raise RuntimeError("cancelling a wakeup requires its originating thread and bridge")
+    if payload.get("wake_mode") != "session":
+        raise RuntimeError("Goal wakeups follow the existing Goal pause/cancel controls")
+    reply = await request_bridge(BRIDGE_SOCKET, {"action": "cancel_wakeup", "job_id": job_id, "thread_id": thread_id})
+    cancelled = reply.get("wakeup_cancelled") is True
+    if cancelled:
+        _update_job_metadata(job_id, automatic_wakeup=False, wake_delivery="cancelled_by_user")
+    return {"job_id": job_id, "wakeup_cancelled": cancelled, "job_cancelled": False}
 
 
 @mcp.tool(

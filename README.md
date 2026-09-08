@@ -1,10 +1,12 @@
 # Codex MCP Longrun
 
 Codex MCP Longrun is a local STDIO MCP server for bounded, non-interactive
-command jobs. Its asynchronous workflow returns a job ID promptly so Codex
+command jobs. Its asynchronous workflow records a job ID at startup so Codex
 does not need to keep a blocking tool call alive through model-visible wait
-loops. The experimental `codex-longrun` launcher can pause a durable Goal while
-the command runs and reactivate that exact Goal once terminal metadata exists.
+loops. The experimental `codex-longrun` launcher supports automatic continuation
+with or without a durable Goal. Active Goals keep their existing pause/resume
+flow. Ordinary sessions use a held tool call, a confirmed turn interruption, and
+a persisted startup receipt before one completion turn starts in the same thread.
 
 It is intended for builds, test suites, packaging jobs, and similar trusted
 foreground commands. The local server validates the request, supervises the
@@ -14,29 +16,32 @@ process group, captures bounded output, and persists terminal metadata.
 Codex calls longrun.start_job once through codex-longrun
                   |
                   v
-The local MCP server starts the command,
-returns a job ID, and the bridge pauses the Goal
+The local MCP server starts the command;
+the coordinator prepares Goal or session continuation
                   |
                   v
-Codex ends the turn; the command runs without model polling
+Goal: Codex ends the turn. Session: the coordinator interrupts it.
+The command runs without model polling.
                   |
                   v
-Terminal event -> idle check -> Goal reactivated once
+Terminal event -> Goal reactivated OR one session turn started
 ```
 
 The project is currently a Linux/WSL pilot, not a production release.
 
 > [!IMPORTANT]
 > This README describes the `experimental` branch and package version
-> `0.4.0a9`. Its recommended Goal workflow is `codex-longrun` plus
-> `start_job(wake_policy="goal")`. The manual Goal and blocking workflows are
+> `0.4.0a10`. Use `start_job(wake_policy="goal")` for active Goals and
+> `start_job(wake_policy="session")` without a pending Goal. With the launcher,
+> `auto` selects the applicable mode. The manual Goal and blocking workflows are
 > compatibility fallbacks and must not be combined with automatic wakeup.
 
 ## Why use it
 
 Repeatedly checking a long build with model-visible polling tools consumes
 context and may require additional model turns even when nothing changed.
-`start_job` avoids keeping the original tool call pending. It does not make the
+`start_job` does not keep the tool call pending for the command's lifetime.
+Session mode holds it only for the bounded handoff to the coordinator. It does not make the
 initial submission or resumed result turn token-free. In an ordinary `codex`
 process it cannot wake an idle thread; the opt-in launcher adds that client-side
 capability through the official experimental App Server protocol.
@@ -62,8 +67,9 @@ client has been verified to render progress without re-entering the model.
 | Tool | Purpose |
 | --- | --- |
 | `health` | Report the version, state paths, allowed roots, and active guardrails |
-| `start_job` | Start one command and optionally arm a durable Goal wake lease |
+| `start_job` | Start one command and arm Goal or session continuation |
 | `get_job` | Read one bounded status or terminal result for a known job ID |
+| `cancel_wakeup` | Cancel this thread's pending session wakeup without killing its job |
 | `cancel_job` | Request process-group cancellation for one exact job ID |
 | `run_and_wait` | Legacy blocking compatibility mode; exposed for explicit one-call workflows |
 | `read_log_tail` | Read a bounded tail for a known job ID |
@@ -71,6 +77,11 @@ client has been verified to render progress without re-entering the model.
 Do not repeatedly call `get_job` in the same turn. Automatic Goal wakeup is
 available only when Codex was started through `codex-longrun` and the returned
 status says `automatic_wakeup = true`.
+
+For ordinary sessions, see [Session continuation](docs/SESSION_WAKEUP.md).
+The coordinator terminates the held tool transport intentionally. Its persisted
+receipt identifies the launched job even when the outer `functions.exec` is
+shown as interrupted; do not resubmit that job. No Goal is created.
 
 ## One-time secret stdin
 
@@ -238,7 +249,7 @@ The configuration script:
 - refuses to overwrite an existing `mcp_servers.longrun` entry;
 - creates a timestamped private backup under `~/.codex/backups`;
 - keeps the MCP optional with `required = false`;
-- allows only `health`, `start_job`, `get_job`, `cancel_job`, `run_and_wait`, and `read_log_tail`;
+- allows only `health`, `start_job`, `get_job`, `cancel_wakeup`, `cancel_job`, `run_and_wait`, and `read_log_tail`;
 - forwards `LONGRUN_BRIDGE_SOCKET` only when the opt-in launcher sets it;
 - configures command start, cancellation, and log reads to require approval;
 - keeps bounded metadata-only `get_job` reads automatic;

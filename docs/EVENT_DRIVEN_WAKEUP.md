@@ -1,20 +1,20 @@
 # Event-Driven Codex Goal Wakeup
 
 The experimental `codex-longrun` launcher provides event-driven completion
-without a custom Codex build. It composes four processes:
+without a custom Codex build. The proxy and bridge share one coordinator process:
 
 ```text
 official Codex TUI --remote
             |
             v
-bounded TUI compatibility proxy
+bounded TUI compatibility proxy (coordinator)
             |
             v
 official codex app-server on a private Unix socket
        |                         |
        | MCP tool call           | Goal JSON-RPC
        v                         v
-codex-mcp-longrun <------> codex-longrun-bridge
+codex-mcp-longrun <------> Goal/session bridge (coordinator)
 ```
 
 The launcher exports a per-process `LONGRUN_BRIDGE_SOCKET` to App Server. The
@@ -22,7 +22,7 @@ global MCP registration names that variable in `env_vars`, so only the MCP
 server spawned under this launcher receives the private bridge endpoint.
 Ordinary Codex processes do not create the variable and keep manual behavior.
 
-App Server, the bridge, and the proxy each run below an isolated Linux/WSL
+App Server and the coordinator each run below an isolated Linux/WSL
 supervisor. The supervisor arms `PR_SET_PDEATHSIG=SIGTERM`, rechecks the
 expected launcher PPID, and watches a launcher-owned pipe for EOF. Parent loss
 therefore triggers a bounded `SIGTERM` then `SIGKILL` sweep of the daemon's
@@ -30,15 +30,21 @@ complete process group, including wrapper descendants. The interactive TUI
 keeps its controlling terminal and uses a direct exec guard instead. This
 prevents an orphaned native App Server from retaining a thread writer lock.
 
-The TUI proxy is not part of Goal delivery. It transparently relays the
+The TUI proxy is not part of Goal activation. It transparently relays the
 bidirectional App Server protocol, including approvals and notifications. Its
-only compatibility intervention is a large Legacy
+history compatibility intervention is a large Legacy
 `thread/read(includeTurns=true)`: in default `auto` mode, it returns a bounded
 latest-turn page or a summary with no visible turns. The Goal bridge keeps its
 own direct App Server connection, and `thread/resume` remains transparent, so
 the proxy changes TUI scrollback rather than the model-visible resumed context.
 On the tested Codex 0.147.0 path, the TUI sends `excludeTurns=true` on resume
 and follows it with the Legacy full read that the proxy intercepts.
+
+Starting in 0.4.0a10, the coordinator also handles [session continuation without
+a Goal](SESSION_WAKEUP.md). This mode uses the owning TUI connection for a
+bounded held-call handoff and one completion turn; approvals remain with that
+TUI. It does not use the experimental raw-response event stream. The Goal
+protocol below is unchanged.
 
 The protection modes are:
 
