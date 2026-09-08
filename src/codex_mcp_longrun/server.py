@@ -37,12 +37,14 @@ from .secret_input import (
     DEFAULT_SECRET_TTL_SEC,
     SECRET_ID_RE,
     claim_one_time_secret,
+    claim_secret_pair,
     secret_dir,
+    validate_secret_pair,
 )
 
 
 SERVER_NAME = "Codex MCP Longrun"
-SERVER_VERSION = "0.4.0a8"
+SERVER_VERSION = "0.4.0a9"
 DEFAULT_MAX_LOG_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_TIMEOUT_SEC = 12 * 60 * 60
 DEFAULT_HEARTBEAT_INITIAL_SEC = 0
@@ -349,6 +351,8 @@ MCP_INSTRUCTIONS = (
     "or environment. For a command that reads one password from stdin, prefer "
     "project_memory_stage_test_asset_for_longrun when a suitable encrypted test-only asset exists, and pass "
     "only its one-time stdin_secret_id; do not ask the user to re-enter an enrolled credential. Use "
+    "stdin_secret_ids only when a reviewed command needs exactly two separately staged handles and "
+    "explicitly decodes the versioned base64 JSON stdin envelope. Never mix scalar and pair inputs. Use "
     "codex-longrun-secret only when no suitable asset exists. Secret-stdin jobs suppress all "
     "captured output and do not support success/failure text matching. Shell and privilege-elevation commands "
     "are disabled. Normal job output stays in a private local log and only a bounded tail is returned. "
@@ -382,6 +386,7 @@ class HealthResult(BaseModel):
     recovered_orphan_jobs: int
     bridge_configured: bool
     secret_stdin_supported: bool
+    secret_stdin_pair_supported: bool
     secret_ttl_sec: int
     max_stdin_secret_bytes: int
 
@@ -788,6 +793,7 @@ async def _run_background_job(
     registration: WakeRegistration | None,
     wake_metadata: dict[str, object],
     stdin_secret_id: str | None,
+    stdin_secret_ids: dict[str, str] | None = None,
 ) -> RunResult:
     try:
         return await _execute_job(
@@ -805,6 +811,7 @@ async def _run_background_job(
             ready_event,
             wake_metadata,
             stdin_secret_id,
+            stdin_secret_ids,
         )
     except asyncio.CancelledError:
         raise
@@ -973,6 +980,21 @@ def _validate_stdin_secret_id(value: str | None) -> str | None:
     if not isinstance(value, str) or not SECRET_ID_RE.fullmatch(value):
         raise ValueError("stdin_secret_id must be a 32-character lowercase hexadecimal handle")
     return value
+
+
+def _validate_secret_inputs(
+    scalar: str | None, pair: dict[str, str] | None,
+    success_contains: str | None, failure_contains: str | None,
+) -> tuple[str | None, dict[str, str] | None]:
+    scalar = _validate_stdin_secret_id(scalar)
+    pair = validate_secret_pair(pair)
+    if scalar is not None and pair is not None:
+        raise ValueError("stdin_secret_id and stdin_secret_ids are mutually exclusive")
+    if (scalar is not None or pair is not None) and (
+        success_contains not in (None, "") or failure_contains not in (None, "")
+    ):
+        raise ValueError("success_contains and failure_contains are unavailable with secret stdin")
+    return scalar, pair
 
 
 def _limit_tail(text: str, max_lines: int, max_bytes: int) -> str:
@@ -1168,6 +1190,7 @@ async def health() -> HealthResult:
         recovered_orphan_jobs=RECOVERED_ORPHAN_JOBS,
         bridge_configured=bool(BRIDGE_SOCKET),
         secret_stdin_supported=True,
+        secret_stdin_pair_supported=hasattr(os, "memfd_create"),
         secret_ttl_sec=SECRET_TTL_SEC,
         max_stdin_secret_bytes=MAX_STDIN_SECRET_BYTES,
     )
@@ -1188,6 +1211,7 @@ async def _execute_job(
     ready_event: asyncio.Event | None = None,
     wake_metadata: dict[str, object] | None = None,
     stdin_secret_id: str | None = None,
+    stdin_secret_ids: dict[str, str] | None = None,
 ) -> RunResult:
     """Execute one validated job and persist a bounded terminal result."""
     _ensure_state_dirs()
@@ -1197,7 +1221,7 @@ async def _execute_job(
     tail_path = JOBS_DIR / f"{job_id}.tail.txt"
     metadata_path = JOBS_DIR / f"{job_id}.json"
     wake_metadata = dict(wake_metadata or {})
-    stdin_secret_supplied = stdin_secret_id not in (None, "")
+    stdin_secret_supplied = stdin_secret_id not in (None, "") or stdin_secret_ids is not None
     output_suppressed = stdin_secret_supplied
 
     try:
@@ -1207,13 +1231,9 @@ async def _execute_job(
             raise ValueError(f"timeout_sec exceeds configured maximum {MAX_TIMEOUT_SEC}")
         success_contains = _validate_match_text(success_contains, "success_contains")
         failure_contains = _validate_match_text(failure_contains, "failure_contains")
-        stdin_secret_id = _validate_stdin_secret_id(stdin_secret_id)
-        if stdin_secret_id is not None and (
-            success_contains is not None or failure_contains is not None
-        ):
-            raise ValueError(
-                "success_contains and failure_contains are unavailable with secret stdin"
-            )
+        stdin_secret_id, stdin_secret_ids = _validate_secret_inputs(
+            stdin_secret_id, stdin_secret_ids, success_contains, failure_contains
+        )
         process_env = _build_process_env(resolved_cwd)
     except Exception as exc:
         result = RunResult(
@@ -1263,14 +1283,19 @@ async def _execute_job(
     _atomic_write_text(STATE_DIR / "latest-log-path", str(log_path) + "\n")
 
     stdin_secret_fd: int | None = None
-    if stdin_secret_id is not None:
+    if stdin_secret_id is not None or stdin_secret_ids is not None:
         try:
-            stdin_secret_fd = claim_one_time_secret(
-                STATE_DIR,
-                stdin_secret_id,
-                ttl_sec=SECRET_TTL_SEC,
-                max_bytes=MAX_STDIN_SECRET_BYTES,
-            )
+            if stdin_secret_ids is not None:
+                stdin_secret_fd = claim_secret_pair(
+                    STATE_DIR, stdin_secret_ids,
+                    ttl_sec=SECRET_TTL_SEC, max_bytes=MAX_STDIN_SECRET_BYTES,
+                )
+            else:
+                assert stdin_secret_id is not None
+                stdin_secret_fd = claim_one_time_secret(
+                    STATE_DIR, stdin_secret_id,
+                    ttl_sec=SECRET_TTL_SEC, max_bytes=MAX_STDIN_SECRET_BYTES,
+                )
         except Exception as exc:
             result = RunResult(
                 job_id=job_id,
@@ -1602,6 +1627,14 @@ async def start_job(
         ),
     ] = "auto",
     ctx: Context | None = None,
+    stdin_secret_ids: Annotated[
+        dict[str, str] | None,
+        Field(description=(
+            "Exactly two public role names mapped to distinct one-time stdin handles, never secret values. "
+            "Mutually exclusive with stdin_secret_id. Child must decode the versioned base64 JSON stdin "
+            "envelope. Both handles are consumed; output is suppressed."
+        )),
+    ] = None,
 ) -> JobStatusResult:
     """Start one approved job and optionally arm event-driven Goal wakeup."""
     job_id = _new_job_id()
@@ -1612,13 +1645,9 @@ async def start_job(
             raise ValueError(f"timeout_sec exceeds configured maximum {MAX_TIMEOUT_SEC}")
         _validate_match_text(success_contains, "success_contains")
         _validate_match_text(failure_contains, "failure_contains")
-        _validate_stdin_secret_id(stdin_secret_id)
-        if stdin_secret_id is not None and (
-            success_contains not in (None, "") or failure_contains not in (None, "")
-        ):
-            raise ValueError(
-                "success_contains and failure_contains are unavailable with secret stdin"
-            )
+        stdin_secret_id, stdin_secret_ids = _validate_secret_inputs(
+            stdin_secret_id, stdin_secret_ids, success_contains, failure_contains
+        )
     except Exception:
         resolved_cwd = None
     if resolved_cwd is not None:
@@ -1676,6 +1705,7 @@ async def start_job(
                 registration,
                 wake_metadata,
                 stdin_secret_id,
+                stdin_secret_ids,
             ),
             name=f"codex-longrun-{job_id}",
         )
@@ -1792,6 +1822,14 @@ async def run_and_wait(
     tail_lines: Annotated[int, Field(ge=0, le=200)] = 80,
     tail_bytes: Annotated[int, Field(ge=1024, le=65536)] = 16384,
     ctx: Context | None = None,
+    stdin_secret_ids: Annotated[
+        dict[str, str] | None,
+        Field(description=(
+            "Exactly two public role names mapped to distinct one-time stdin handles, never secret values. "
+            "Mutually exclusive with stdin_secret_id. Child must decode the versioned base64 JSON stdin "
+            "envelope. Both handles are consumed; output is suppressed."
+        )),
+    ] = None,
 ) -> RunResult:
     """Legacy blocking mode for clients that can await tools without model-driven polling."""
     job_id = _new_job_id()
@@ -1812,6 +1850,7 @@ async def run_and_wait(
         tail_bytes,
         ctx,
         stdin_secret_id=stdin_secret_id,
+        stdin_secret_ids=stdin_secret_ids,
     )
 
 

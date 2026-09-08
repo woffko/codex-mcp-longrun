@@ -12,6 +12,7 @@ import unittest
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
+from websockets.sync.client import unix_connect
 
 from codex_mcp_longrun.launcher import (
     LauncherOptions,
@@ -77,6 +78,9 @@ class LauncherArgumentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             runtime_parent = Path(directory) / "runtime"
             runtime_parent.mkdir(mode=0o755)
+            # Longrun intentionally starts children with umask 077. Establish
+            # the unsafe fixture explicitly instead of letting umask make it safe.
+            runtime_parent.chmod(0o755)
             with patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(runtime_parent)}):
                 with self.assertRaisesRegex(RuntimeError, "not private and same-user owned"):
                     _runtime_parent()
@@ -265,8 +269,15 @@ class ParentDeathGuardTests(unittest.TestCase):
                 observed_pids = {guarded_pid, *_descendant_pids(guarded_pid)}
                 self.assertGreaterEqual(len(observed_pids), 2)
                 time.sleep(0.2)
+                # Startup helpers may exit normally. A real websocket ping
+                # proves the App Server is alive without assuming every
+                # transient descendant must survive until the kill probe.
+                with unix_connect(str(socket_path), uri="ws://localhost/rpc", compression=None,
+                                  open_timeout=3, close_timeout=1) as connection:
+                    self.assertTrue(connection.ping().wait(2), "App Server did not answer ping")
+                observed_pids.update(_descendant_pids(guarded_pid))
                 self.assertTrue(
-                    all(_process_state(pid) not in {None, "Z"} for pid in observed_pids),
+                    parent.poll() is None and _process_state(guarded_pid) not in {None, "Z"},
                     "guarded App Server did not remain stable while launcher was alive",
                 )
 

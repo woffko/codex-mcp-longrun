@@ -28,7 +28,7 @@ The project is currently a Linux/WSL pilot, not a production release.
 
 > [!IMPORTANT]
 > This README describes the `experimental` branch and package version
-> `0.4.0a8`. Its recommended Goal workflow is `codex-longrun` plus
+> `0.4.0a9`. Its recommended Goal workflow is `codex-longrun` plus
 > `start_job(wake_policy="goal")`. The manual Goal and blocking workflows are
 > compatibility fallbacks and must not be combined with automatic wakeup.
 
@@ -142,6 +142,56 @@ consumed, the value exists briefly in a local `0600` file. It does not defend
 against root, another compromised process running as the same OS user, memory
 inspection, or filesystem forensics. Use an external secret broker or run the
 command manually when that stronger boundary is required.
+
+### Two saved test secrets in one coordinated command
+
+For a reviewed command that explicitly understands the pair envelope, stage
+each existing test-asset field separately through Project Memory and pass only
+the two returned handles:
+
+```text
+longrun.start_job(
+  argv=[...],
+  cwd="/absolute/enrolled/root",
+  stdin_secret_ids={"ssh": "FIRST_ONE_TIME_HANDLE", "gui": "SECOND_ONE_TIME_HANDLE"},
+  wake_policy="goal"
+)
+```
+
+`stdin_secret_ids` requires exactly two distinct handles. Public role names
+must match `[a-z][a-z0-9_]{0,31}`. This option is mutually exclusive with
+`stdin_secret_id`, `success_contains` and `failure_contains`. It is available
+on both execution tools; `start_job` remains the normal Goal workflow.
+Malformed maps are rejected before handle consumption or Goal registration.
+Registration failure does not consume either handle. If assembly fails after
+a successful claim, that handle stays consumed: stage new handles instead of
+retrying a partially consumed pair. No command starts with an incomplete pair.
+
+The child receives one finite JSON stdin payload with exactly these fields:
+
+```json
+{"schemaVersion":1,"encoding":"base64","secrets":{"ssh":"BASE64_BYTES","gui":"BASE64_BYTES"}}
+```
+
+Values encode the exact staged bytes, including any terminal newline; the
+receiving command must validate the schema/role set and decode base64 itself.
+Base64 is framing, not encryption. Each raw read and the complete encoded
+envelope are bounded by `LONGRUN_MAX_STDIN_SECRET_BYTES`; encoding overhead
+means the total usable raw size is less than that limit.
+
+The combined payload is assembled in a Linux `memfd`, sealed against writes,
+growth, shrinkage and further seal changes, then handed to the existing stdin
+supervisor. No extra on-disk bundle is created. Original one-time files still
+follow the existing private-file/TTL/unlink policy. Pair mode keeps output
+suppression on all execution and error paths and does not persist handles or
+payloads in job metadata. It does not protect against swap, core dumps,
+privileged memory inspection, a malicious receiving command, or promise secure
+erasure of Python allocations. Scalar stdin remains byte-for-byte unchanged.
+
+After upgrading, restart the Codex/MCP process before using the new schema.
+`health.secret_stdin_pair_supported` indicates whether the loaded server
+offers this transport; older already-running servers do not acquire it merely
+because source files changed.
 
 ## Requirements
 
