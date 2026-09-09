@@ -167,7 +167,6 @@ class BridgeState:
             """
             SELECT * FROM wake_leases
             WHERE state IN ('preparing', 'armed', 'terminal')
-              AND delivery_state NOT IN ('resumed', 'abandoned', 'needs_manual_recovery')
             ORDER BY created_at
             """
         ).fetchall()

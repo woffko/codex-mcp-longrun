@@ -9,11 +9,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+from datetime import datetime
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -30,6 +32,9 @@ async def probe(args: argparse.Namespace) -> None:
     requests: list[dict] = []
     events: list[dict] = []
     seed_mode = args.resume
+    goal_mode = args.policy == "goal"
+    goal_job_id = None
+    goal_completed = threading.Event()
     code = "import time,sys; time.sleep(1); print('SESSION_JOB_OK'); sys.exit(" + ("7" if args.outcome == "failure" else "0") + ")"
     if args.outcome == "timeout":
         code = "import time; time.sleep(8)"
@@ -64,8 +69,24 @@ async def probe(args: argparse.Namespace) -> None:
                         "content": [{"type": "output_text", "text": "READY", "annotations": []}]}
             elif number == 1 or (args.chain and number == 3):
                 code = "text(await tools.mcp__longrun__start_job(" + json.dumps(job_args) + ")); text('HANDOFF_MUST_NOT_RETURN');"
+                if goal_mode:
+                    code = "text(await tools.mcp__longrun__start_job(" + json.dumps(job_args) + "));"
                 item = {"type": "custom_tool_call", "id": f"start_item_{number}", "call_id": f"start_call_{number}",
                         "namespace": "functions", "name": "exec", "input": code}
+            elif goal_mode and number == 2:
+                time.sleep(args.goal_final_delay)
+                item = {"type": "message", "id": "goal_wait_item", "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text", "text": "Waiting for the registered Longrun job.", "annotations": []}]}
+            elif goal_mode and number == 3:
+                item = {"type": "custom_tool_call", "id": "goal_get_item", "call_id": "goal_get_call",
+                        "namespace": "functions", "name": "exec", "input":
+                        "text(await tools.mcp__longrun__get_job(" + json.dumps({"job_id": goal_job_id}) + "));"}
+            elif goal_mode:
+                # The test driver completes its synthetic Goal after observing
+                # the result, so no autonomous extra turn can escape this fixture.
+                goal_completed.wait(5)
+                item = {"type": "message", "id": "goal_done_item", "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text", "text": "GOAL_WAKE_OK", "annotations": []}]}
             elif number == 2 and args.user_activity:
                 item = {"type": "message", "id": "manual_item", "role": "assistant", "status": "completed",
                         "content": [{"type": "output_text", "text": "MANUAL_OK", "annotations": []}]}
@@ -260,20 +281,44 @@ LONGRUN_BRIDGE_SOCKET = {json.dumps(str(bridge_socket))}
             await call("thread/unsubscribe", {"threadId": thread_id})
             await call("thread/resume", {"threadId": thread_id, "excludeTurns": True})
         assert (await call("thread/goal/get", {"threadId": thread_id}))["goal"] is None
-        first_id = (await call("turn/start", {"threadId": thread_id, "input": [
-            {"type": "text", "text": "Run the isolated session continuation test."}]}))["turn"]["id"]
+        if goal_mode:
+            test_goal = (await call("thread/goal/set", {"threadId": thread_id,
+                "objective": "Complete the isolated Longrun Goal wakeup test.", "status": "active"}))["goal"]
+            first_id = None
+        else:
+            first_id = (await call("turn/start", {"threadId": thread_id, "input": [
+                {"type": "text", "text": "Run the isolated session continuation test."}]}))["turn"]["id"]
         statuses = []
         job_result = None
         while len(statuses) < (3 if args.chain else 2):
             message = await asyncio.wait_for(queue.get(), 15)
             params = message.get("params", {})
             item = params.get("item", {})
+            if goal_mode and message.get("method") == "turn/started" and first_id is None:
+                first_id = params["turn"]["id"]
+            if goal_mode and message.get("method") == "item/completed" and item.get("tool") == "start_job":
+                assert item["status"] == "completed", item.get("error")
+                goal_job_id = item["result"]["structuredContent"]["job_id"]
+                if args.goal_user_pause:
+                    await call("thread/goal/set", {"threadId": thread_id, "status": "paused"})
             if message.get("method") == "item/completed" and item.get("tool") == "get_job":
                 job_result = item["result"]["structuredContent"]
+                if goal_mode:
+                    await call("thread/goal/set", {"threadId": thread_id, "status": "complete"})
+                    goal_completed.set()
             if message.get("method") == "turn/completed":
                 statuses.append((params["turn"]["id"], params["turn"]["status"]))
-                if statuses[0] != (first_id, "interrupted"):
+                if statuses[0] != (first_id, "completed" if goal_mode else "interrupted"):
                     raise AssertionError(f"handoff did not interrupt the first turn: {statuses}; {root}")
+                if goal_mode and args.goal_user_pause:
+                    await asyncio.sleep(3)
+                    final_goal = (await call("thread/goal/get", {"threadId": thread_id}))["goal"]
+                    assert final_goal["status"] == "paused" and len(requests) == 2
+                    with sqlite3.connect(root / "bridge.db") as db:
+                        state, delivery = db.execute("SELECT state,delivery_state FROM wake_leases WHERE job_id=?", (goal_job_id,)).fetchone()
+                    assert (state, delivery) == ("abandoned", "abandoned"), (state, delivery)
+                    print(json.dumps({"result": "PASS", "policy": "goal", "manual_pause_preserved": True, "artifacts": str(root)}))
+                    return
                 if len(statuses) == 1 and args.user_activity:
                     await call("turn/start", {"threadId": thread_id, "input": [
                         {"type": "text", "text": "[manual takeover] Stop automatic continuation and answer this instead."}]})
@@ -286,7 +331,6 @@ LONGRUN_BRIDGE_SOCKET = {json.dumps(str(bridge_socket))}
             assert len(metadata) == 1
             job = json.loads(metadata[0].read_text())
             assert job["state"] == "succeeded" and len(requests) == 2, (job, len(requests))
-            import sqlite3
             with sqlite3.connect(root / "bridge.db") as db:
                 state, wake_turn = db.execute("SELECT state,wake_turn_id FROM wake_leases").fetchone()
             assert state == "abandoned" and wake_turn is None
@@ -295,6 +339,24 @@ LONGRUN_BRIDGE_SOCKET = {json.dumps(str(bridge_socket))}
         expected = {"success": "succeeded", "failure": "failed", "timeout": "timed_out"}[args.outcome]
         assert job_result and job_result["state"] == expected and job_result["terminal"], job_result
         assert job_result["tail"].strip() == ("" if args.outcome == "timeout" else "SESSION_JOB_OK"), job_result
+        if goal_mode:
+            assert len(requests) == 4, len(requests)
+            final_goal = (await call("thread/goal/get", {"threadId": thread_id}))["goal"]
+            assert final_goal["status"] == "complete" and final_goal["objective"] == test_goal["objective"]
+            assert final_goal["createdAt"] == test_goal["createdAt"]
+            with sqlite3.connect(root / "bridge.db") as db:
+                state, delivery, terminal = db.execute("SELECT state,delivery_state,terminal_state FROM wake_leases WHERE job_id=?", (goal_job_id,)).fetchone()
+                trace = [(json.loads(details), stamp) for details, stamp in db.execute(
+                    "SELECT details_json,created_at FROM bridge_events WHERE job_id=? ORDER BY id", (goal_job_id,))]
+            assert (state, delivery, terminal) == ("delivered", "resumed", expected), (state, delivery, terminal)
+            assert not any(x.get("state") == "abandoned" for x, _ in trace), trace
+            activated = next(stamp for details, stamp in trace if details.get("delivery_state") == "resumed")
+            finished = datetime.fromisoformat(job_result["finished_at_utc"]).timestamp()
+            delay = activated - finished
+            assert -.1 <= delay < 10, delay
+            print(json.dumps({"result": "PASS", "policy": "goal", "normal_terminal": terminal,
+                              "activation_delay_sec": round(delay, 3), "turns": statuses, "artifacts": str(root)}))
+            return
         assert len(requests) == (5 if args.chain else 3), len(requests)
         before_wake = requests[-2]["input"]
         assert any(x.get("role") == "developer" and "[Longrun session handoff]" in json.dumps(x)
@@ -330,14 +392,22 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codex", default=shutil.which("codex"))
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--policy", choices=("session", "auto"), default="session")
+    parser.add_argument("--policy", choices=("session", "auto", "goal"), default="session")
     parser.add_argument("--outcome", choices=("success", "failure", "timeout"), default="success")
     parser.add_argument("--user-activity", action="store_true")
     parser.add_argument("--chain", action="store_true")
     parser.add_argument("--tui", action="store_true")
     parser.add_argument("--launcher", action="store_true")
     parser.add_argument("--installed", action="store_true")
+    parser.add_argument("--goal-user-pause", action="store_true")
+    parser.add_argument("--goal-final-delay", type=float, default=0)
     options = parser.parse_args()
+    if not 0 <= options.goal_final_delay <= 5:
+        parser.error("--goal-final-delay must be between 0 and 5 seconds")
+    if options.goal_user_pause and options.policy != "goal":
+        parser.error("--goal-user-pause requires --policy goal")
+    if options.policy == "goal" and (options.tui or options.launcher or options.user_activity or options.chain or options.resume):
+        parser.error("the Goal probe uses its own isolated protocol lifecycle; combine only with --outcome/--installed")
     if options.launcher:
         options.tui = True
     asyncio.run(asyncio.wait_for(probe(options), 25))
