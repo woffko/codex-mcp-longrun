@@ -58,6 +58,27 @@ No mode edits the stored JSONL or changes its `historyMode`.
 
 ## Protocol
 
+Since `0.4.0a11`, Goal pause notifications received before the RPC reply are
+buffered and reconciled with the confirmed paused state. Codex `updatedAt`
+timestamps have second precision, so explicit Goal controls from the TUI also
+revoke pending wakeup directly. Activation and forwarding those user controls
+are serialized so an in-flight bridge activation cannot overwrite a later user
+pause. Normal completion and deadline callbacks cannot revive revoked leases.
+An old contradictory `armed`/`abandoned` row is retired on recovery; ambiguous
+activation is left for manual recovery without retrying the activation RPC.
+
+The regression checks include both notification orders, same-second controls,
+early terminal delivery, RPC cancellation, and real isolated App Server flows:
+
+```bash
+.venv/bin/python tests/helpers/session_runtime_probe.py --policy goal
+.venv/bin/python tests/helpers/session_runtime_probe.py --policy goal --goal-final-delay 2
+.venv/bin/python tests/helpers/session_runtime_probe.py --policy goal --goal-user-pause
+```
+
+Keep existing sessions open until their pending work is handled before restarting
+the launcher to load an upgrade. Installing files does not patch a live bridge.
+
 1. Codex calls `start_job` with `wake_policy="goal"`.
 2. Codex adds the current `threadId` to MCP request `_meta`. The server ignores
    model arguments for thread identity.

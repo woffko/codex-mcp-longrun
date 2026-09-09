@@ -31,12 +31,19 @@ The project is currently a Linux/WSL pilot, not a production release.
 
 > [!IMPORTANT]
 > This README describes the `main` branch and package version
-> `0.4.0a10`. Use `start_job(wake_policy="goal")` for active Goals and
+> `0.4.0a11`. Use `start_job(wake_policy="goal")` for active Goals and
 > `start_job(wake_policy="session")` without a pending Goal. With the launcher,
 > `auto` selects the applicable mode. The manual Goal and blocking workflows are
 > compatibility fallbacks and must not be combined with automatic wakeup.
 
 ## Why use it
+
+Version `0.4.0a11` fixes a Goal pause-notification race that could discard the
+normal completion event and defer wakeup until the job's safety deadline.
+Pause notifications are reconciled with the RPC reply, revoked leases cannot
+be rearmed by registration or deadline recovery, and explicit TUI Goal controls
+preserve user intent even when timestamps coincide. Restart the launcher after
+upgrading; already-running coordinators retain their loaded code.
 
 Repeatedly checking a long build with model-visible polling tools consumes
 context and may require additional model turns even when nothing changed.

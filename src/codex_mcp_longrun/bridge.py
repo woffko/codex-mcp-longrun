@@ -12,6 +12,7 @@ import signal
 import stat
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -33,11 +34,14 @@ class GoalBridge:
         )
         self.server: asyncio.AbstractServer | None = None
         self._thread_events: dict[str, asyncio.Event] = {}
-        # Track the exact Goal revision produced by a bridge-owned status
-        # change. A later user change to the same status (for example, an
-        # explicit pause while a job is running) must not be mistaken for our
-        # own update.
+        # Track in-flight activation separately from pause confirmation.
+        # updatedAt has second precision; explicit TUI controls also carry
+        # user intent when two changes have identical timestamps.
         self._expected_goal_status: dict[str, tuple[str, int | None]] = {}
+        # Pause notifications and the RPC reply may arrive in either order.
+        # Reconcile against the reply instead of guessing its timestamp.
+        self._pause_notifications: dict[str, list[dict[str, Any]]] = {}
+        self._goal_controls: dict[str, asyncio.Lock] = {}
         self._delivery_tasks: dict[str, asyncio.Task[None]] = {}
         self._deadline_tasks: dict[str, asyncio.Task[None]] = {}
 
@@ -151,7 +155,8 @@ class GoalBridge:
 
         existing = self.state.get(job_id)
         if existing is not None:
-            if existing.thread_id == thread_id and existing.state in {"preparing", "armed"}:
+            if (existing.thread_id == thread_id and existing.state == "armed"
+                    and existing.delivery_state == "pending"):
                 return {"ok": True, "automatic_wakeup": True, "idempotent": True}
             raise RuntimeError("job already has a non-reusable wake lease")
 
@@ -172,7 +177,7 @@ class GoalBridge:
             goal_updated_at=updated_at,
             deadline_at=time.time() + timeout_sec + grace_period_sec + 60,
         )
-        self._expected_goal_status[thread_id] = ("paused", updated_at)
+        self._pause_notifications[thread_id] = []
         try:
             paused_result = await self.app.call(
                 "thread/goal/set", {"threadId": thread_id, "status": "paused"}
@@ -181,24 +186,51 @@ class GoalBridge:
             if not self._same_goal(lease, paused) or paused.get("status") != "paused":
                 raise RuntimeError("Goal identity changed while the wake lease was being armed")
             paused_updated_at = paused.get("updatedAt")
-            if not isinstance(paused_updated_at, int):
+            if type(paused_updated_at) is not int or paused_updated_at < updated_at:
                 raise RuntimeError("App Server returned incomplete paused Goal revision")
-            self._expected_goal_status[thread_id] = ("paused", paused_updated_at)
-            self.state.update(
+            # Also catch a manual change whose notification has not arrived.
+            latest = self._goal_from_result(await self.app.call("thread/goal/get", {"threadId": thread_id}))
+            if (not self._same_goal(lease, latest) or latest.get("status") != "paused"
+                    or latest.get("updatedAt") != paused_updated_at):
+                raise RuntimeError("Goal changed while its bridge pause was being confirmed")
+            saw_paused_notification = False
+            for notification in self._pause_notifications[thread_id]:
+                revision = notification.get("updatedAt")
+                if self._same_goal(lease, notification) and type(revision) is int and revision <= updated_at:
+                    continue  # Superseded by the active snapshot read before our pause.
+                if (not saw_paused_notification and self._same_goal(lease, notification)
+                        and notification.get("status") == "active" and type(revision) is int
+                        and revision <= paused_updated_at):
+                    continue  # Goal accounting may update the active snapshot before pause.
+                if (not self._same_goal(lease, notification) or notification.get("status") != "paused"
+                        or notification.get("updatedAt") != paused_updated_at):
+                    raise RuntimeError("Goal was changed outside the bridge during registration")
+                saw_paused_notification = True
+            current = self.state.get(job_id)
+            if current is None or current.state != "preparing" or current.delivery_state != "pending":
+                raise RuntimeError("wake registration was revoked before pause confirmation")
+            # No await between the state check and commit. Never resurrect an
+            # abandoned lease or discard a terminal event received while arming.
+            completed_early = current.terminal_state is not None
+            lease = self.state.update(
                 job_id,
-                state="armed",
+                state="terminal" if completed_early else "armed",
+                delivery_state="waiting_for_idle" if completed_early else "pending",
                 goal_updated_at=paused_updated_at,
             )
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             self._expected_goal_status.pop(thread_id, None)
-            self.state.update(
-                job_id,
-                state="abandoned",
-                delivery_state="abandoned",
-                error=f"prepare failed: {exc}",
-            )
+            current = self.state.get(job_id)
+            if current is not None and current.state == "preparing":
+                self.state.update(job_id, state="abandoned", delivery_state="abandoned",
+                                  error=f"prepare failed: {exc}")
             raise
-        self._schedule_deadline(self.state.get(job_id) or lease)
+        finally:
+            self._pause_notifications.pop(thread_id, None)
+        if lease.state == "terminal":
+            self._schedule_delivery(lease)
+        else:
+            self._schedule_deadline(lease)
         return {"ok": True, "automatic_wakeup": True, "thread_id": thread_id}
 
     async def _terminal(self, job_id: str, request: dict[str, Any]) -> dict[str, Any]:
@@ -211,6 +243,14 @@ class GoalBridge:
             raise RuntimeError("no matching wake lease")
         if lease.delivery_state in {"resumed", "abandoned", "needs_manual_recovery"}:
             return {"ok": True, "delivery_state": lease.delivery_state, "idempotent": True}
+        if lease.state == "terminal":
+            return {"ok": True, "delivery_state": lease.delivery_state, "idempotent": True}
+        if lease.state == "preparing" and lease.delivery_state == "pending":
+            if lease.terminal_state is None:
+                self.state.update(job_id, terminal_state=terminal_state)
+            return {"ok": True, "delivery_state": "waiting_for_registration"}
+        if lease.state != "armed" or lease.delivery_state != "pending":
+            raise RuntimeError("wake lease is not armed for terminal delivery")
         lease = self.state.update(
             job_id,
             state="terminal",
@@ -232,6 +272,13 @@ class GoalBridge:
             raise RuntimeError("wake lease belongs to another thread")
         if lease.delivery_state in {"resumed", "abandoned", "needs_manual_recovery"}:
             return {"ok": True, "delivery_state": lease.delivery_state}
+        if lease.state == "preparing":
+            self._abandon_for_manual_change(thread_id, "Wake registration aborted before pause confirmation")
+            return {"ok": True, "delivery_state": "abandoned"}
+        if lease.state == "terminal":
+            return {"ok": True, "delivery_state": lease.delivery_state}
+        if lease.state != "armed" or lease.delivery_state != "pending":
+            raise RuntimeError("wake lease cannot be aborted from its current state")
         lease = self.state.update(
             job_id,
             state="terminal",
@@ -243,81 +290,14 @@ class GoalBridge:
 
     async def _deliver(self, lease: WakeLease) -> None:
         try:
-            await self._wait_until_idle(lease.thread_id)
             current = self.state.get(lease.job_id)
-            if current is None or current.delivery_state in {
-                "resumed",
-                "abandoned",
-                "needs_manual_recovery",
-            }:
+            if current is None or current.state != "terminal" or current.delivery_state != "waiting_for_idle":
                 return
-            result = await self.app.call("thread/goal/get", {"threadId": lease.thread_id})
-            goal = self._goal_from_result(result)
-            if not self._same_goal(lease, goal):
-                self.state.update(
-                    lease.job_id,
-                    state="abandoned",
-                    delivery_state="abandoned",
-                    error="Goal identity changed before terminal delivery",
-                )
-                return
-            status = goal.get("status")
-            if status == "active":
-                self.state.update(
-                    lease.job_id,
-                    state="abandoned",
-                    delivery_state="abandoned",
-                    error="Goal was resumed outside the bridge",
-                )
-                return
-            if status != "paused":
-                self.state.update(
-                    lease.job_id,
-                    state="abandoned",
-                    delivery_state="abandoned",
-                    error=f"Goal status changed to {status!r}",
-                )
-                return
-            self.state.update(lease.job_id, delivery_state="activating")
-            # The App Server may emit the notification before or after the
-            # response. During this one status change, status is sufficient;
-            # user changes to paused still do not match it.
-            self._expected_goal_status[lease.thread_id] = ("active", None)
-            try:
-                activated_result = await self.app.call(
-                    "thread/goal/set", {"threadId": lease.thread_id, "status": "active"}
-                )
-            except Exception as exc:
-                self._expected_goal_status.pop(lease.thread_id, None)
-                # An interrupted status-changing request is ambiguous. Never retry
-                # it automatically; a duplicate active transition could start an
-                # extra Goal turn.
-                self.state.update(
-                    lease.job_id,
-                    state="failed",
-                    delivery_state="needs_manual_recovery",
-                    error=f"ambiguous Goal activation: {exc}",
-                )
-                return
-            activated = self._goal_from_result(activated_result)
-            if not self._same_goal(lease, activated) or activated.get("status") != "active":
-                self.state.update(
-                    lease.job_id,
-                    state="failed",
-                    delivery_state="needs_manual_recovery",
-                    error="App Server did not confirm Goal activation",
-                )
-                return
-            if not isinstance(activated.get("updatedAt"), int):
-                self.state.update(
-                    lease.job_id,
-                    state="failed",
-                    delivery_state="needs_manual_recovery",
-                    error="App Server returned incomplete active Goal revision",
-                )
-                return
-            self._expected_goal_status.pop(lease.thread_id, None)
-            self.state.update(lease.job_id, state="delivered", delivery_state="resumed")
+            while True:
+                await self._wait_until_idle(lease.thread_id)
+                async with self._goal_controls.setdefault(lease.thread_id, asyncio.Lock()):
+                    if await self._activate_goal(lease):
+                        return
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -331,6 +311,104 @@ class GoalBridge:
                 )
         finally:
             self._delivery_tasks.pop(lease.job_id, None)
+
+    async def _activate_goal(self, lease: WakeLease) -> bool:
+        # Recheck idle under the same lock used to forward explicit TUI Goal
+        # controls. A new ordinary turn can win the race before this lock.
+        status = await self.app.call("thread/read", {"threadId": lease.thread_id, "includeTurns": False})
+        if self._thread_status(status) != "idle":
+            return False
+        current = self.state.get(lease.job_id)
+        if current is None or current.delivery_state in {
+            "resumed",
+            "abandoned",
+            "needs_manual_recovery",
+        }:
+            return True
+        result = await self.app.call("thread/goal/get", {"threadId": lease.thread_id})
+        goal = self._goal_from_result(result)
+        current = self.state.get(lease.job_id)
+        if current is None or current.state != "terminal" or current.delivery_state != "waiting_for_idle":
+            return True
+        if not self._same_goal(lease, goal):
+            self.state.update(
+                lease.job_id,
+                state="abandoned",
+                delivery_state="abandoned",
+                error="Goal identity changed before terminal delivery",
+            )
+            return True
+        status = goal.get("status")
+        if status == "active":
+            self.state.update(
+                lease.job_id,
+                state="abandoned",
+                delivery_state="abandoned",
+                error="Goal was resumed outside the bridge",
+            )
+            return True
+        if status != "paused":
+            self.state.update(
+                lease.job_id,
+                state="abandoned",
+                delivery_state="abandoned",
+                error=f"Goal status changed to {status!r}",
+            )
+            return True
+        if goal.get("updatedAt") != current.goal_updated_at:
+            self.state.update(lease.job_id, state="abandoned", delivery_state="abandoned",
+                              error="Paused Goal revision changed before terminal delivery")
+            return True
+        self.state.update(lease.job_id, delivery_state="activating")
+        # The App Server may emit the notification before or after the
+        # response. During this one status change, status is sufficient;
+        # user changes to paused still do not match it.
+        self._expected_goal_status[lease.thread_id] = ("active", None)
+        try:
+            activated_result = await self.app.call(
+                "thread/goal/set", {"threadId": lease.thread_id, "status": "active"}
+            )
+        except Exception as exc:
+            self._expected_goal_status.pop(lease.thread_id, None)
+            # An interrupted status-changing request is ambiguous. Never retry
+            # it automatically; a duplicate active transition could start an
+            # extra Goal turn.
+            self.state.update(
+                lease.job_id,
+                state="failed",
+                delivery_state="needs_manual_recovery",
+                error=f"ambiguous Goal activation: {exc}",
+            )
+            return True
+        activated = self._goal_from_result(activated_result)
+        if not self._same_goal(lease, activated) or activated.get("status") != "active":
+            self.state.update(
+                lease.job_id,
+                state="failed",
+                delivery_state="needs_manual_recovery",
+                error="App Server did not confirm Goal activation",
+            )
+            return True
+        if not isinstance(activated.get("updatedAt"), int):
+            self.state.update(
+                lease.job_id,
+                state="failed",
+                delivery_state="needs_manual_recovery",
+                error="App Server returned incomplete active Goal revision",
+            )
+            return True
+        self._expected_goal_status.pop(lease.thread_id, None)
+        self.state.update(lease.job_id, state="delivered", delivery_state="resumed")
+        return True
+
+    async def user_goal_control(self, thread_id: str, operation: Callable[[], Awaitable[Any]]) -> Any:
+        # Record user intent even if updatedAt cannot distinguish two changes
+        # within the same second. If activation is already in flight, forward
+        # the user's control afterward so the bridge cannot overwrite it.
+        self._abandon_for_manual_change(thread_id, "Explicit user Goal control")
+        async with self._goal_controls.setdefault(thread_id, asyncio.Lock()):
+            self._abandon_for_manual_change(thread_id, "Explicit user Goal control")
+            return await operation()
 
     async def _wait_until_idle(self, thread_id: str) -> None:
         event = self._thread_events.setdefault(thread_id, asyncio.Event())
@@ -378,6 +456,13 @@ class GoalBridge:
         goal = params.get("goal")
         if not isinstance(thread_id, str) or not isinstance(goal, dict):
             return
+        pending = self._pause_notifications.get(thread_id)
+        if pending is not None:
+            if len(pending) >= 64:
+                self._abandon_for_manual_change(thread_id, "Too many Goal changes during pause confirmation")
+            else:
+                pending.append({key: goal.get(key) for key in ("threadId", "objective", "createdAt", "updatedAt", "status")})
+            return
         expected = self._expected_goal_status.get(thread_id)
         if expected is not None:
             expected_status, expected_updated_at = expected
@@ -389,6 +474,9 @@ class GoalBridge:
         lease = self.state.live_for_thread(thread_id)
         if lease is None:
             return
+        revision = goal.get("updatedAt")
+        if self._same_goal(lease, goal) and type(revision) is int and revision < lease.goal_updated_at:
+            return  # A delayed older event cannot revoke a newer confirmed pause.
         if (
             not self._same_goal(lease, goal)
             or goal.get("status") != "paused"
@@ -414,6 +502,16 @@ class GoalBridge:
             deadline.cancel()
 
     def _recover_lease(self, lease: WakeLease) -> None:
+        if lease.delivery_state in {"abandoned", "resumed", "needs_manual_recovery"}:
+            # Retire contradictory rows written by older versions without
+            # touching the Goal or scheduling their stale deadline.
+            state = {"abandoned": "abandoned", "resumed": "delivered", "needs_manual_recovery": "failed"}[lease.delivery_state]
+            self.state.update(lease.job_id, state=state)
+            return
+        if lease.delivery_state == "activating":
+            self.state.update(lease.job_id, state="failed", delivery_state="needs_manual_recovery",
+                              error="bridge restarted during ambiguous Goal activation")
+            return
         if lease.state == "terminal":
             self._schedule_delivery(lease)
         elif lease.state == "armed":
@@ -444,7 +542,7 @@ class GoalBridge:
         try:
             await asyncio.sleep(max(0.0, lease.deadline_at - time.time()))
             current = self.state.get(lease.job_id)
-            if current is None or current.state != "armed":
+            if current is None or current.state != "armed" or current.delivery_state != "pending":
                 return
             current = self.state.update(
                 lease.job_id,

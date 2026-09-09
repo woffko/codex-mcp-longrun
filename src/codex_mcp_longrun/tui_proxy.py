@@ -261,7 +261,11 @@ class TuiCompatibilityProxy:
                             for tid, owner in list(self.session_bridge.peers.items()):
                                 if owner is peer:
                                     self.session_bridge.user_activity(tid)
-                        await send_upstream(raw)
+                        if (isinstance(thread_id, str)
+                                and message.get("method") in {"thread/goal/set", "thread/goal/clear"}):
+                            await self.session_bridge.user_goal_control(thread_id, lambda: send_upstream(raw))
+                        else:
+                            await send_upstream(raw)
                     continue
                 if message is None or message.get("method") != "thread/read":
                     await send_upstream(raw)
