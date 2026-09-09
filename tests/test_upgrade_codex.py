@@ -74,7 +74,7 @@ class UpgradeCodexTests(unittest.TestCase):
         longrun = parsed["mcp_servers"]["longrun"]
         self.assertEqual(
             longrun["enabled_tools"],
-            ["health", "start_job", "get_job", "cancel_job", "run_and_wait", "read_log_tail"],
+            ["health", "start_job", "get_job", "cancel_wakeup", "cancel_job", "run_and_wait", "read_log_tail"],
         )
         self.assertEqual(longrun["env_vars"], ["LONGRUN_BRIDGE_SOCKET"])
         self.assertEqual(longrun["env"]["LONGRUN_HEARTBEAT_INITIAL_SEC"], "0")

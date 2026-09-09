@@ -22,6 +22,12 @@ class WakeLease:
     terminal_state: str | None
     delivery_state: str
     error: str | None
+    wake_mode: str = "goal"
+    turn_id: str | None = None
+    call_id: str | None = None
+    handoff_state: str = "not_applicable"
+    receipt_state: str | None = None
+    wake_turn_id: str | None = None
 
 
 class BridgeState:
@@ -63,6 +69,19 @@ class BridgeState:
             """
         )
         self._db.commit()
+        # Additive migration keeps old Goal leases and their accounting intact.
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(wake_leases)")}
+        for name, declaration in {
+            "wake_mode": "TEXT NOT NULL DEFAULT 'goal'",
+            "turn_id": "TEXT",
+            "call_id": "TEXT",
+            "handoff_state": "TEXT NOT NULL DEFAULT 'not_applicable'",
+            "receipt_state": "TEXT",
+            "wake_turn_id": "TEXT",
+        }.items():
+            if name not in columns:
+                self._db.execute(f"ALTER TABLE wake_leases ADD COLUMN {name} {declaration}")
+        self._db.commit()
 
     def close(self) -> None:
         self._db.close()
@@ -76,6 +95,9 @@ class BridgeState:
         goal_created_at: int,
         goal_updated_at: int,
         deadline_at: float,
+        wake_mode: str = "goal",
+        turn_id: str | None = None,
+        call_id: str | None = None,
     ) -> WakeLease:
         now = time.time()
         try:
@@ -85,8 +107,9 @@ class BridgeState:
                     INSERT INTO wake_leases (
                         job_id, thread_id, objective, goal_created_at,
                         goal_updated_at, state, deadline_at, terminal_state,
-                        delivery_state, error, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 'preparing', ?, NULL, 'pending', NULL, ?, ?)
+                        delivery_state, error, created_at, updated_at,
+                        wake_mode, turn_id, call_id, handoff_state
+                    ) VALUES (?, ?, ?, ?, ?, 'preparing', ?, NULL, 'pending', NULL, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         job_id,
@@ -97,6 +120,10 @@ class BridgeState:
                         deadline_at,
                         now,
                         now,
+                        wake_mode,
+                        turn_id,
+                        call_id,
+                        "pending" if wake_mode == "session" else "not_applicable",
                     ),
                 )
                 self._event_locked(job_id, "prepare", {"thread_id": thread_id})
@@ -106,13 +133,14 @@ class BridgeState:
                 if existing.thread_id != thread_id:
                     raise RuntimeError("job ID is already registered for a different thread") from exc
                 return existing
-            raise RuntimeError("this Goal already has a live longrun wake lease") from exc
+            raise RuntimeError("this thread already has a live longrun wake lease") from exc
         lease = self.get(job_id)
         assert lease is not None
         return lease
 
     def update(self, job_id: str, **fields: Any) -> WakeLease:
-        allowed = {"state", "terminal_state", "delivery_state", "error", "goal_updated_at"}
+        allowed = {"state", "terminal_state", "delivery_state", "error", "goal_updated_at",
+                   "handoff_state", "receipt_state", "wake_turn_id"}
         if not fields or not set(fields).issubset(allowed):
             raise ValueError("invalid wake lease update")
         fields["updated_at"] = time.time()
@@ -179,4 +207,10 @@ class BridgeState:
             terminal_state=(str(row["terminal_state"]) if row["terminal_state"] is not None else None),
             delivery_state=str(row["delivery_state"]),
             error=str(row["error"]) if row["error"] is not None else None,
+            wake_mode=str(row["wake_mode"]),
+            turn_id=row["turn_id"],
+            call_id=row["call_id"],
+            handoff_state=str(row["handoff_state"]),
+            receipt_state=row["receipt_state"],
+            wake_turn_id=row["wake_turn_id"],
         )

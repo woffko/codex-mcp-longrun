@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -65,7 +66,7 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
                 health = await asyncio.wait_for(session.call_tool("health", {}), 5)
 
         self.assertEqual(initialized.server_info.name, "codex-longrun")
-        self.assertEqual(initialized.server_info.version, "0.4.0a7")
+        self.assertEqual(initialized.server_info.version, "0.4.0a10")
         self.assertIn("wake_policy='goal'", initialized.instructions or "")
         self.assertIn("collaboration.wait_agent", initialized.instructions or "")
         self.assertIn("wake_policy='none' only", initialized.instructions or "")
@@ -76,20 +77,23 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("do not ask the user to re-enter", initialized.instructions or "")
         self.assertEqual(
             [tool.name for tool in tools.tools],
-            ["health", "start_job", "get_job", "cancel_job", "run_and_wait", "read_log_tail"],
+            ["health", "start_job", "get_job", "cancel_wakeup", "cancel_job", "run_and_wait", "read_log_tail"],
         )
         run_tool = next(tool for tool in tools.tools if tool.name == "run_and_wait")
         self.assertNotIn("ctx", run_tool.input_schema.get("properties", {}))
         self.assertIn("stdin_secret_id", run_tool.input_schema.get("properties", {}))
+        self.assertIn("stdin_secret_ids", run_tool.input_schema.get("properties", {}))
         start_tool = next(tool for tool in tools.tools if tool.name == "start_job")
         self.assertIn("stdin_secret_id", start_tool.input_schema.get("properties", {}))
+        self.assertIn("stdin_secret_ids", start_tool.input_schema.get("properties", {}))
         self.assertFalse(health.is_error)
         self.assertTrue(health.structured_content["ok"])
-        self.assertEqual(health.structured_content["server_version"], "0.4.0a7")
+        self.assertEqual(health.structured_content["server_version"], "0.4.0a10")
         self.assertEqual(health.structured_content["heartbeat_initial_sec"], 1)
         self.assertEqual(health.structured_content["heartbeat_interval_sec"], 2)
         self.assertEqual(health.structured_content["max_active_jobs"], 4)
         self.assertTrue(health.structured_content["secret_stdin_supported"])
+        self.assertTrue(health.structured_content["secret_stdin_pair_supported"])
         self.assertEqual(health.structured_content["secret_ttl_sec"], 300)
         self.assertEqual(health.structured_content["max_stdin_secret_bytes"], 65536)
 
@@ -460,6 +464,129 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
             max_bytes=server.MAX_STDIN_SECRET_BYTES,
         )
         os.close(descriptor)
+
+    async def test_02c_pair_delivery_is_exact_and_output_is_suppressed_in_both_modes(self) -> None:
+        for asynchronous in (False, True):
+            secrets = {"ssh": b"ssh-synthetic\x00\xff\n", "gui": b"gui-synthetic\n"}
+            handles = {name: create_one_time_secret(TEST_STATE, data) for name, data in secrets.items()}
+            receipt = TEST_STATE / f"pair-digests-{asynchronous}.json"
+            code = (
+                "import base64,errno,fcntl,hashlib,json,os,pathlib,sys\n"
+                "raw=sys.stdin.buffer.read()\n"
+                "envelope=json.loads(raw)\n"
+                "assert set(envelope)=={'schemaVersion','encoding','secrets'}\n"
+                "assert envelope['schemaVersion']==1 and envelope['encoding']=='base64'\n"
+                "assert fcntl.fcntl(0,1034)&15==15\n"
+                "for operation in (lambda:os.write(0,b'x'),lambda:os.ftruncate(0,0),lambda:os.ftruncate(0,999999)):\n"
+                " try: operation(); sys.exit(42)\n"
+                " except OSError as error: assert error.errno==errno.EPERM\n"
+                "values={name:base64.b64decode(data,validate=True) for name,data in envelope['secrets'].items()}\n"
+                "assert set(values)=={'ssh','gui'}\n"
+                "pathlib.Path(sys.argv[1]).write_text(json.dumps({name:hashlib.sha256(data).hexdigest() for name,data in values.items()}))\n"
+                "sys.stdout.buffer.write(raw)\n"
+                "for value in values.values(): sys.stdout.buffer.write(value); sys.stderr.buffer.write(value)\n"
+            )
+            kwargs = dict(argv=[sys.executable, "-c", code, str(receipt)], cwd=str(TEST_ROOT),
+                          stdin_secret_ids=handles, timeout_sec=5)
+            if asynchronous:
+                submitted = await server.start_job(**kwargs, wake_policy="none")
+                await _wait_for(lambda: json.loads(Path(submitted.metadata_path).read_text()).get("state")
+                                in server.TERMINAL_JOB_STATES, timeout=5)
+                result = await server.get_job(submitted.job_id)
+            else:
+                result = await server.run_and_wait(**kwargs)
+            self.assertEqual(result.state, "succeeded", result.error)
+            self.assertTrue(result.stdin_secret_supplied)
+            self.assertTrue(result.output_suppressed)
+            self.assertEqual(result.tail, "")
+            self.assertEqual(json.loads(receipt.read_text()),
+                             {name: hashlib.sha256(data).hexdigest() for name, data in secrets.items()})
+            metadata = Path(result.metadata_path).read_bytes()
+            log = Path(result.log_path).read_bytes()
+            tail = (TEST_STATE / "jobs" / f"{result.job_id}.tail.txt").read_bytes()
+            serialized = result.model_dump_json().encode()
+            self.assertEqual(log, b"")
+            self.assertEqual(tail, b"")
+            for value in (*secrets.values(), *(base64.b64encode(data) for data in secrets.values()),
+                          *(handle.encode() for handle in handles.values())):
+                for surface in (metadata, log, tail, serialized):
+                    self.assertNotIn(value, surface)
+            self.assertNotIn("stdin_secret_ids", json.loads(metadata))
+            self.assertFalse(any((secret_dir(TEST_STATE) / f"{handle}.stdin").exists()
+                                 for handle in handles.values()))
+
+    async def test_02d_invalid_pairs_do_not_claim_or_register(self) -> None:
+        handles = {"ssh": create_one_time_secret(TEST_STATE, b"first"),
+                   "gui": create_one_time_secret(TEST_STATE, b"second")}
+        for invalid in ({"stdin_secret_ids": {}},
+                        {"stdin_secret_ids": {"ssh": handles["ssh"], "gui": handles["ssh"]}},
+                        {"stdin_secret_ids": handles, "stdin_secret_id": handles["ssh"]},
+                        {"stdin_secret_ids": handles, "success_contains": "forbidden"},
+                        {"stdin_secret_ids": handles, "failure_contains": "forbidden"}):
+            with patch.object(server, "_prepare_wake_registration", new_callable=AsyncMock) as register:
+                rejected = await server.start_job(argv=[sys.executable, "-c", "pass"],
+                                                  cwd=str(TEST_ROOT), wake_policy="goal", timeout_sec=5, **invalid)
+                self.assertEqual(rejected.state, "spawn_error")
+                self.assertTrue(rejected.output_suppressed)
+                register.assert_not_awaited()
+            self.assertTrue(all((secret_dir(TEST_STATE) / f"{handle}.stdin").exists()
+                                for handle in handles.values()))
+
+    async def test_02e_registration_failure_does_not_consume_pair(self) -> None:
+        handles = {"ssh": create_one_time_secret(TEST_STATE, b"first"),
+                   "gui": create_one_time_secret(TEST_STATE, b"second")}
+        with patch.object(server, "_prepare_wake_registration", new_callable=AsyncMock,
+                          side_effect=RuntimeError("synthetic registration failure")):
+            with self.assertRaisesRegex(RuntimeError, "synthetic registration failure"):
+                await server.start_job(argv=[sys.executable, "-c", "pass"], cwd=str(TEST_ROOT),
+                                       stdin_secret_ids=handles, wake_policy="goal", timeout_sec=5)
+        self.assertTrue(all((secret_dir(TEST_STATE) / f"{handle}.stdin").exists()
+                            for handle in handles.values()))
+
+    async def test_02f_partial_pair_failure_never_launches_child(self) -> None:
+        first = create_one_time_secret(TEST_STATE, b"first")
+        handles = {"ssh": first, "gui": "f" * 32}
+        marker = TEST_STATE / "pair-must-not-launch"
+        rejected = await server.run_and_wait(
+            argv=[sys.executable, "-c", "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(marker)],
+            cwd=str(TEST_ROOT), stdin_secret_ids=handles, timeout_sec=5,
+        )
+        self.assertEqual(rejected.state, "spawn_error")
+        self.assertTrue(rejected.output_suppressed)
+        self.assertFalse(marker.exists())
+        self.assertFalse((secret_dir(TEST_STATE) / f"{first}.stdin").exists())
+        for handle in handles.values():
+            self.assertNotIn(handle, rejected.model_dump_json())
+
+    async def test_02g_pair_is_accepted_by_real_stdio_mcp_schema(self) -> None:
+        values = {"ssh": b"stdio-first", "gui": b"stdio-second\n"}
+        handles = {name: create_one_time_secret(TEST_STATE, data) for name, data in values.items()}
+        receipt = TEST_STATE / "stdio-pair-digests.json"
+        code = (
+            "import base64,hashlib,json,pathlib,sys; envelope=json.load(sys.stdin); "
+            "values={key:base64.b64decode(value,validate=True) for key,value in envelope['secrets'].items()}; "
+            "pathlib.Path(sys.argv[1]).write_text(json.dumps({key:hashlib.sha256(value).hexdigest() for key,value in values.items()})); "
+            "print(envelope, flush=True)"
+        )
+        params = StdioServerParameters(command=str(TEST_ROOT / ".venv/bin/codex-mcp-longrun"),
+                                       env=dict(os.environ), cwd=TEST_ROOT)
+        async with stdio_client(params) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                submitted = await session.call_tool("start_job", {
+                    "argv": [sys.executable, "-c", code, str(receipt)], "cwd": str(TEST_ROOT),
+                    "stdin_secret_ids": handles, "timeout_sec": 5, "wake_policy": "none",
+                }, read_timeout_seconds=5)
+                self.assertFalse(submitted.is_error)
+                metadata = Path(submitted.structured_content["metadata_path"])
+                await _wait_for(lambda: json.loads(metadata.read_text()).get("state")
+                                in server.TERMINAL_JOB_STATES, timeout=5)
+                completed = await session.call_tool("get_job", {"job_id": submitted.structured_content["job_id"]})
+                self.assertEqual(completed.structured_content["state"], "succeeded")
+                self.assertTrue(completed.structured_content["output_suppressed"])
+                self.assertEqual(completed.structured_content["tail"], "")
+        self.assertEqual(json.loads(receipt.read_text()),
+                         {name: hashlib.sha256(data).hexdigest() for name, data in values.items()})
 
     async def test_03_rejections_and_nonzero_exit(self) -> None:
         shell_link = TEST_STATE / "innocent-name"

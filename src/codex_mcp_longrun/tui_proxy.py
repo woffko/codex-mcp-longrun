@@ -12,6 +12,7 @@ import socket
 import stat
 import struct
 import sys
+import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -122,6 +123,7 @@ class TuiCompatibilityProxy:
         helper_timeout_sec: float = DEFAULT_HELPER_TIMEOUT_SEC,
         helper_max_message_bytes: int = HELPER_MAX_MESSAGE_BYTES,
         proxy_max_message_bytes: int = PROXY_MAX_MESSAGE_BYTES,
+        session_bridge: Any = None,
     ) -> None:
         if legacy_history_mode not in VALID_MODES:
             raise ValueError(f"unsupported Legacy history mode: {legacy_history_mode}")
@@ -138,6 +140,7 @@ class TuiCompatibilityProxy:
         self.helper_max_message_bytes = helper_max_message_bytes
         self.proxy_max_message_bytes = proxy_max_message_bytes
         self.server: Server | None = None
+        self.session_bridge = session_bridge
 
     async def start(self) -> None:
         self.tui_socket.parent.mkdir(parents=True, exist_ok=True)
@@ -201,6 +204,9 @@ class TuiCompatibilityProxy:
         upstream_send_lock = asyncio.Lock()
         client_send_lock = asyncio.Lock()
         intercepted: set[asyncio.Task[None]] = set()
+        internal_requests: dict[str, asyncio.Future[Any]] = {}
+        internal_ids: dict[str, None] = {}
+        activity_lock = asyncio.Lock()
 
         async def send_upstream(raw: str | bytes) -> None:
             async with upstream_send_lock:
@@ -215,9 +221,48 @@ class TuiCompatibilityProxy:
             async with client_send_lock:
                 await client.send(raw)
 
+        class Peer:
+            async def call(self, method: str, params: dict[str, Any]) -> Any:
+                request_id = "longrun-control-" + uuid.uuid4().hex
+                future = asyncio.get_running_loop().create_future()
+                internal_requests[request_id] = future
+                internal_ids[request_id] = None
+                if len(internal_ids) > 256:
+                    internal_ids.pop(next(iter(internal_ids)))
+                try:
+                    await send_upstream(json.dumps({"id": request_id, "method": method, "params": params}))
+                    response = await asyncio.wait_for(future, 10)
+                    if "error" in response:
+                        raise AppServerError(f"{method}: {response['error']}")
+                    return response.get("result")
+                finally:
+                    internal_requests.pop(request_id, None)
+
+            async def exclusive(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+                async with activity_lock:
+                    return await operation()
+
+        peer = Peer()
+
         async def client_to_upstream() -> None:
             async for raw in client:
                 message = _decode_object(raw)
+                if self.session_bridge is not None and message is not None and message.get("method") in {
+                    "turn/start", "turn/steer", "turn/interrupt", "thread/archive", "thread/unsubscribe",
+                    "thread/start", "thread/resume",
+                    "thread/goal/set", "thread/goal/clear", "thread/rollback", "thread/compact/start",
+                }:
+                    async with activity_lock:
+                        params = message.get("params", {})
+                        thread_id = params.get("threadId") if isinstance(params, dict) else None
+                        if isinstance(thread_id, str):
+                            self.session_bridge.user_activity(thread_id)
+                        else:
+                            for tid, owner in list(self.session_bridge.peers.items()):
+                                if owner is peer:
+                                    self.session_bridge.user_activity(tid)
+                        await send_upstream(raw)
+                    continue
                 if message is None or message.get("method") != "thread/read":
                     await send_upstream(raw)
                     continue
@@ -263,6 +308,18 @@ class TuiCompatibilityProxy:
         async def upstream_to_client() -> None:
             async for raw in upstream:
                 message = _decode_object(raw)
+                if message is not None and "method" not in message:
+                    pending_internal = internal_requests.get(message.get("id"))
+                    if pending_internal is not None:
+                        if not pending_internal.done():
+                            pending_internal.set_result(message)
+                        continue
+                    if message.get("id") in internal_ids:
+                        continue  # A late reply to a timed-out internal RPC is not a TUI reply.
+                if self.session_bridge is not None and message is not None:
+                    method, params = message.get("method"), message.get("params")
+                    if isinstance(method, str) and isinstance(params, dict):
+                        await self.session_bridge.observe(peer, method, params)
                 if message is not None and message.get("method") in {
                     "turn/started",
                     "turn/completed",
@@ -306,6 +363,11 @@ class TuiCompatibilityProxy:
         except ConnectionClosed:
             pass
         finally:
+            if self.session_bridge is not None:
+                self.session_bridge.disconnected(peer)
+            for future in list(internal_requests.values()):
+                if not future.done():
+                    future.set_exception(AppServerError("owning TUI connection closed"))
             for task in intercepted:
                 task.cancel()
             for task in intercepted:

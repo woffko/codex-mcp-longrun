@@ -16,10 +16,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-DEFAULT_TOOLS = ["health", "start_job", "get_job", "cancel_job", "run_and_wait", "read_log_tail"]
+DEFAULT_TOOLS = ["health", "start_job", "get_job", "cancel_wakeup", "cancel_job", "run_and_wait", "read_log_tail"]
 TOOL_APPROVALS = {
     "start_job": "prompt",
     "get_job": "auto",
+    "cancel_wakeup": "prompt",
     "cancel_job": "prompt",
     "run_and_wait": "prompt",
     "read_log_tail": "prompt",

@@ -137,13 +137,18 @@ appropriate instruction file without replacing existing content:
 - For reviewed, trusted, non-interactive commands expected to run longer than
   about 30 seconds, use `longrun.start_job` once when it is available.
 - Pass the command as an argument array and use this project's absolute root as
-  `cwd`. Report the returned job ID and end the turn without polling.
-- Claim automatic wakeup only when Codex was launched through `codex-longrun`,
-  `wake_policy="goal"` was requested, and the result says
-  `automatic_wakeup=true`. In that mode the bridge owns pause/resume; end the
-  submission turn immediately and call `longrun.get_job` exactly once only in
-  the automatically resumed turn. Otherwise use `longrun.get_job` once in a
-  later manually resumed turn.
+  `cwd`.
+- With an active Goal, use `wake_policy="goal"` through `codex-longrun` and
+  require `automatic_wakeup=true`. The bridge owns Goal pause/resume. Report
+  the job ID and end the submission turn immediately.
+- With no pending Goal, require `bridge_reachable=true` and
+  `session_wakeup_supported=true`, then use `wake_policy="session"` in its own
+  executor call. The coordinator interrupts the held transport after startup
+  and saves a receipt. An aborted outer call after that receipt is not a
+  startup failure; never launch a duplicate. Do not create a Goal for wakeup.
+- In either automatic mode, call `longrun.get_job` exactly once on the
+  completion wake and continue the original task. Paused, blocked, and limited
+  Goals must never be bypassed through session mode.
 - Never use `collaboration.wait_agent`, a generic wait tool, `write_stdin`, log
   tails, or status loops to wait for a Longrun job. `collaboration.wait_agent`
   waits for delegated agents, not operating-system processes.
@@ -166,28 +171,32 @@ If the project already has `AGENTS.md`, preserve every unrelated instruction.
 A same-directory `AGENTS.override.md` replaces rather than merges with
 `AGENTS.md`, so do not introduce one casually.
 
-With ordinary `codex`, tell the user to pause the Goal before waiting and resume
-it for the agreed result check. With `codex-longrun`, require
+For an existing Goal in ordinary `codex`, tell the user to pause it before waiting
+and resume it for the agreed result check. With `codex-longrun` and an active Goal, require
 `wake_policy="goal"`, report the returned job ID, end the turn, and let the
 bridge own the `paused -> active` transition. Do not create busywork or
 short-interval status calls to keep a Goal active.
+Without a pending Goal, follow the [session contract](SESSION_WAKEUP.md#agent-contract).
 
 ## 5. Restart or resume the session
 
-Start a new Codex process after installation or enrollment. To resume a known
-session in the verified project root with manual completion:
+After installation or enrollment, provide the actual launcher command in the
+final handoff. Close the old Codex process first. To start a new bridged session:
 
 ```bash
-cd /absolute/path/to/project
-codex resume SESSION_UUID
+"$HOME/.local/share/codex-longrun-mcp/.venv/bin/codex-longrun" \
+  -C "/absolute/path/to/project"
 ```
 
-To opt into event-driven Goal wakeup, resume through the installed launcher:
+To resume a known session with automatic Goal or session continuation:
 
 ```bash
-$HOME/.local/share/codex-longrun-mcp/.venv/bin/codex-longrun \
-  resume -C /absolute/path/to/project SESSION_UUID
+"$HOME/.local/share/codex-longrun-mcp/.venv/bin/codex-longrun" \
+  resume -C "/absolute/path/to/project" "SESSION_UUID"
 ```
+
+Omit the UUID to use the session picker. Ordinary `codex resume` is an explicit
+manual fallback and does not start the bridge.
 
 The UUID selects conversation history. For ordinary Codex, changing the shell
 directory first also ensures that project-scoped `.codex/config.toml` is part
@@ -211,14 +220,17 @@ In the new session, use `/mcp` or call `longrun.health`. Confirm that:
 - shell execution remains disabled;
 - heartbeat is zero unless a specific client was verified for progress;
 - timeout and maximum-active-job values match the intended policy.
-- `bridge_configured` is true only in a session launched through
-  `codex-longrun`.
+- `bridge_configured` and `bridge_reachable` are true in the launcher session;
+- `session_wakeup_supported` is true for continuation without a pending Goal.
 
 For a manual end-to-end check, submit one harmless, bounded, non-interactive
 command with `start_job`, let it finish without MCP status calls, then use
-`get_job` exactly once. For a bridge pilot, use a durable active Goal, call
+`get_job` exactly once. For an existing durable active Goal, call
 `start_job` once with `wake_policy="goal"`, require `automatic_wakeup=true`, and
 verify that the next Goal turn begins only after terminal metadata exists.
+For an ordinary session, use `wake_policy="session"`, verify the handoff receipt
+and originating turn interruption, then verify one completion wake and one
+`get_job` call. Do not create a Goal just to test ordinary session continuation.
 
 Run this check in an interactive Codex process that remains open. Do not use a
 one-shot `codex exec` process for a long asynchronous pilot: after its final
@@ -229,8 +241,8 @@ terminates the command instead of leaving detached work behind.
 
 Report:
 
-- session UUID and executable project-root `codex resume ...` or
-  `codex-longrun resume -C ...` command;
+- executable, shell-quoted `codex-longrun -C ...` command for a new session or
+  `codex-longrun resume -C ... SESSION_UUID` for the known session;
 - enrolled exact root;
 - config backup path;
 - `codex mcp get longrun` and `longrun.health` results;
@@ -280,9 +292,11 @@ Resume reports `thread-store conflict` or `already has an active writer`:
 `start_job` returns `automatic_wakeup=false`:
 
 - confirm the session was launched with `codex-longrun`, not ordinary `codex`;
-- confirm `longrun.health` reports `bridge_configured=true`;
-- confirm the current thread has an active durable Goal;
-- do not poll when `wake_policy="goal"` fails; report the setup failure.
+- confirm `longrun.health` reports `bridge_configured=true` and `bridge_reachable=true`;
+- for `goal`, confirm an active durable Goal; for `session`, require no pending
+  Goal and `session_wakeup_supported=true`;
+- do not poll or launch a duplicate when registration/handoff fails; report the
+  failure and retain any already-started job ID for recovery.
 
 The enrollment command refuses the target:
 

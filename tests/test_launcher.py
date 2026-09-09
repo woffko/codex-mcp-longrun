@@ -12,12 +12,14 @@ import unittest
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
+from websockets.sync.client import unix_connect
 
 from codex_mcp_longrun.launcher import (
     LauncherOptions,
     _guarded_exec_command,
     _parse_args,
     _resolve_codex_cwd,
+    _runtime_parent,
 )
 
 
@@ -64,6 +66,25 @@ def _wait_for(predicate: Callable[[], bool], timeout_sec: float = 10.0) -> bool:
 
 
 class LauncherArgumentTests(unittest.TestCase):
+    def test_missing_configured_runtime_parent_falls_back_to_tmp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing-runtime"
+            with patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(missing)}):
+                runtime_parent = _runtime_parent()
+
+        self.assertEqual(runtime_parent, Path("/tmp").resolve())
+
+    def test_existing_unsafe_runtime_parent_is_still_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_parent = Path(directory) / "runtime"
+            runtime_parent.mkdir(mode=0o755)
+            # Longrun intentionally starts children with umask 077. Establish
+            # the unsafe fixture explicitly instead of letting umask make it safe.
+            runtime_parent.chmod(0o755)
+            with patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(runtime_parent)}):
+                with self.assertRaisesRegex(RuntimeError, "not private and same-user owned"):
+                    _runtime_parent()
+
     def test_proxy_options_are_consumed_and_codex_arguments_are_preserved(self) -> None:
         argv = [
             "codex-longrun",
@@ -248,8 +269,15 @@ class ParentDeathGuardTests(unittest.TestCase):
                 observed_pids = {guarded_pid, *_descendant_pids(guarded_pid)}
                 self.assertGreaterEqual(len(observed_pids), 2)
                 time.sleep(0.2)
+                # Startup helpers may exit normally. A real websocket ping
+                # proves the App Server is alive without assuming every
+                # transient descendant must survive until the kill probe.
+                with unix_connect(str(socket_path), uri="ws://localhost/rpc", compression=None,
+                                  open_timeout=3, close_timeout=1) as connection:
+                    self.assertTrue(connection.ping().wait(2), "App Server did not answer ping")
+                observed_pids.update(_descendant_pids(guarded_pid))
                 self.assertTrue(
-                    all(_process_state(pid) not in {None, "Z"} for pid in observed_pids),
+                    parent.poll() is None and _process_state(guarded_pid) not in {None, "Z"},
                     "guarded App Server did not remain stable while launcher was alive",
                 )
 

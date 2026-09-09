@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import fcntl
 import getpass
+import json
 import os
 import re
 import stat
@@ -16,6 +19,91 @@ from pathlib import Path
 DEFAULT_SECRET_TTL_SEC = 300
 DEFAULT_MAX_SECRET_BYTES = 64 * 1024
 SECRET_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+SECRET_ROLE_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+# Linux UAPI (linux/fcntl.h). Some standalone CPython builds do not export
+# these names even on kernels with memfd sealing support. Unsupported kernels
+# still fail closed on the actual fcntl syscall; no disk fallback is used.
+F_ADD_SEALS = getattr(fcntl, "F_ADD_SEALS", 1033)
+F_GET_SEALS = getattr(fcntl, "F_GET_SEALS", 1034)
+SECRET_SEALS = 0x0001 | 0x0002 | 0x0004 | 0x0008
+
+
+def validate_secret_pair(value: dict[str, str] | None) -> dict[str, str] | None:
+    """Validate public roles and opaque handles without echoing rejected input."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or len(value) != 2:
+        raise ValueError("secret stdin pair requires exactly two named handles")
+    if any(not isinstance(role, str) or not SECRET_ROLE_RE.fullmatch(role)
+           or not isinstance(handle, str) or not SECRET_ID_RE.fullmatch(handle)
+           for role, handle in value.items()):
+        raise ValueError("secret stdin pair contains an invalid role or handle")
+    if len(set(value.values())) != 2:
+        raise ValueError("secret stdin pair handles must be distinct")
+    return dict(value)
+
+
+def claim_secret_pair(
+    state_dir: Path,
+    handles: dict[str, str],
+    *,
+    ttl_sec: int = DEFAULT_SECRET_TTL_SEC,
+    max_bytes: int = DEFAULT_MAX_SECRET_BYTES,
+) -> int:
+    """Consume two handles and return a sealed, memory-backed JSON stdin FD.
+
+    No bundle is staged on disk. A partial failure does not resurrect already
+    consumed handles. Base64 preserves bytes; it is not encryption. Python
+    allocation/swap/core-dump guarantees are outside this transport contract.
+    """
+    validated = validate_secret_pair(handles)
+    if validated is None or not hasattr(os, "memfd_create"):
+        raise ValueError("memory-backed secret stdin is unavailable")
+    descriptor: int | None = None
+    try:
+        descriptor = os.memfd_create("longrun-stdin", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+        fields: dict[str, str] = {}
+        total = 0
+        for role, handle in validated.items():
+            source = claim_one_time_secret(state_dir, handle, ttl_sec=ttl_sec, max_bytes=max_bytes)
+            try:
+                data = bytearray()
+                while True:
+                    chunk = os.read(source, min(8192, max_bytes + 1 - len(data)))
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                    if len(data) > max_bytes:
+                        raise ValueError("secret stdin pair exceeds size limit")
+                total += len(data)
+                if not data or total > max_bytes:
+                    raise ValueError("secret stdin pair exceeds size limit")
+                fields[role] = base64.b64encode(data).decode("ascii")
+            finally:
+                os.close(source)
+        payload = json.dumps({"schemaVersion": 1, "encoding": "base64", "secrets": fields},
+                             sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+        if len(payload) > max_bytes:
+            raise ValueError("secret stdin pair exceeds encoded size limit")
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short secret stdin write")
+            view = view[written:]
+        fcntl.fcntl(descriptor, F_ADD_SEALS, SECRET_SEALS)
+        if fcntl.fcntl(descriptor, F_GET_SEALS) & SECRET_SEALS != SECRET_SEALS:
+            raise ValueError("secret stdin seals were not applied")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        result, descriptor = descriptor, None
+        return result
+    except Exception:
+        # Never let an injected filesystem/decoder exception echo secret bytes,
+        # names or handles into MCP errors or persisted job metadata.
+        raise ValueError("secret stdin pair could not be assembled") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def default_state_dir() -> Path:

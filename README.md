@@ -1,10 +1,12 @@
 # Codex MCP Longrun
 
 Codex MCP Longrun is a local STDIO MCP server for bounded, non-interactive
-command jobs. Its asynchronous workflow returns a job ID promptly so Codex
+command jobs. Its asynchronous workflow records a job ID at startup so Codex
 does not need to keep a blocking tool call alive through model-visible wait
-loops. The experimental `codex-longrun` launcher can pause a durable Goal while
-the command runs and reactivate that exact Goal once terminal metadata exists.
+loops. The experimental `codex-longrun` launcher supports automatic continuation
+with or without a durable Goal. Active Goals keep their existing pause/resume
+flow. Ordinary sessions use a held tool call, a confirmed turn interruption, and
+a persisted startup receipt before one completion turn starts in the same thread.
 
 It is intended for builds, test suites, packaging jobs, and similar trusted
 foreground commands. The local server validates the request, supervises the
@@ -14,29 +16,32 @@ process group, captures bounded output, and persists terminal metadata.
 Codex calls longrun.start_job once through codex-longrun
                   |
                   v
-The local MCP server starts the command,
-returns a job ID, and the bridge pauses the Goal
+The local MCP server starts the command;
+the coordinator prepares Goal or session continuation
                   |
                   v
-Codex ends the turn; the command runs without model polling
+Goal: Codex ends the turn. Session: the coordinator interrupts it.
+The command runs without model polling.
                   |
                   v
-Terminal event -> idle check -> Goal reactivated once
+Terminal event -> Goal reactivated OR one session turn started
 ```
 
 The project is currently a Linux/WSL pilot, not a production release.
 
 > [!IMPORTANT]
-> This README describes the `experimental` branch and package version
-> `0.4.0a7`. Its recommended Goal workflow is `codex-longrun` plus
-> `start_job(wake_policy="goal")`. The manual Goal and blocking workflows are
+> This README describes the `main` branch and package version
+> `0.4.0a10`. Use `start_job(wake_policy="goal")` for active Goals and
+> `start_job(wake_policy="session")` without a pending Goal. With the launcher,
+> `auto` selects the applicable mode. The manual Goal and blocking workflows are
 > compatibility fallbacks and must not be combined with automatic wakeup.
 
 ## Why use it
 
 Repeatedly checking a long build with model-visible polling tools consumes
 context and may require additional model turns even when nothing changed.
-`start_job` avoids keeping the original tool call pending. It does not make the
+`start_job` does not keep the tool call pending for the command's lifetime.
+Session mode holds it only for the bounded handoff to the coordinator. It does not make the
 initial submission or resumed result turn token-free. In an ordinary `codex`
 process it cannot wake an idle thread; the opt-in launcher adds that client-side
 capability through the official experimental App Server protocol.
@@ -62,8 +67,9 @@ client has been verified to render progress without re-entering the model.
 | Tool | Purpose |
 | --- | --- |
 | `health` | Report the version, state paths, allowed roots, and active guardrails |
-| `start_job` | Start one command and optionally arm a durable Goal wake lease |
+| `start_job` | Start one command and arm Goal or session continuation |
 | `get_job` | Read one bounded status or terminal result for a known job ID |
+| `cancel_wakeup` | Cancel this thread's pending session wakeup without killing its job |
 | `cancel_job` | Request process-group cancellation for one exact job ID |
 | `run_and_wait` | Legacy blocking compatibility mode; exposed for explicit one-call workflows |
 | `read_log_tail` | Read a bounded tail for a known job ID |
@@ -71,6 +77,11 @@ client has been verified to render progress without re-entering the model.
 Do not repeatedly call `get_job` in the same turn. Automatic Goal wakeup is
 available only when Codex was started through `codex-longrun` and the returned
 status says `automatic_wakeup = true`.
+
+For ordinary sessions, see [Session continuation](docs/SESSION_WAKEUP.md).
+The coordinator terminates the held tool transport intentionally. Its persisted
+receipt identifies the launched job even when the outer `functions.exec` is
+shown as interrupted; do not resubmit that job. No Goal is created.
 
 ## One-time secret stdin
 
@@ -143,11 +154,62 @@ against root, another compromised process running as the same OS user, memory
 inspection, or filesystem forensics. Use an external secret broker or run the
 command manually when that stronger boundary is required.
 
+### Two saved test secrets in one coordinated command
+
+For a reviewed command that explicitly understands the pair envelope, stage
+each existing test-asset field separately through Project Memory and pass only
+the two returned handles:
+
+```text
+longrun.start_job(
+  argv=[...],
+  cwd="/absolute/enrolled/root",
+  stdin_secret_ids={"ssh": "FIRST_ONE_TIME_HANDLE", "gui": "SECOND_ONE_TIME_HANDLE"},
+  wake_policy="goal"
+)
+```
+
+`stdin_secret_ids` requires exactly two distinct handles. Public role names
+must match `[a-z][a-z0-9_]{0,31}`. This option is mutually exclusive with
+`stdin_secret_id`, `success_contains` and `failure_contains`. It is available
+on both execution tools; `start_job` remains the normal Goal workflow.
+Malformed maps are rejected before handle consumption or Goal registration.
+Registration failure does not consume either handle. If assembly fails after
+a successful claim, that handle stays consumed: stage new handles instead of
+retrying a partially consumed pair. No command starts with an incomplete pair.
+
+The child receives one finite JSON stdin payload with exactly these fields:
+
+```json
+{"schemaVersion":1,"encoding":"base64","secrets":{"ssh":"BASE64_BYTES","gui":"BASE64_BYTES"}}
+```
+
+Values encode the exact staged bytes, including any terminal newline; the
+receiving command must validate the schema/role set and decode base64 itself.
+Base64 is framing, not encryption. Each raw read and the complete encoded
+envelope are bounded by `LONGRUN_MAX_STDIN_SECRET_BYTES`; encoding overhead
+means the total usable raw size is less than that limit.
+
+The combined payload is assembled in a Linux `memfd`, sealed against writes,
+growth, shrinkage and further seal changes, then handed to the existing stdin
+supervisor. No extra on-disk bundle is created. Original one-time files still
+follow the existing private-file/TTL/unlink policy. Pair mode keeps output
+suppression on all execution and error paths and does not persist handles or
+payloads in job metadata. It does not protect against swap, core dumps,
+privileged memory inspection, a malicious receiving command, or promise secure
+erasure of Python allocations. Scalar stdin remains byte-for-byte unchanged.
+
+After upgrading, restart the Codex/MCP process before using the new schema.
+`health.secret_stdin_pair_supported` indicates whether the loaded server
+offers this transport; older already-running servers do not acquire it merely
+because source files changed.
+
 ## Requirements
 
 - Linux or WSL;
 - [Codex CLI](https://developers.openai.com/codex/cli) with App Server Unix
-  transport and Goal APIs (tested with Codex CLI `0.147.0`);
+  transport and turn/Goal APIs (session continuation and the real TUI tested
+  with Codex CLI `0.153.4`);
 - [`uv`](https://docs.astral.sh/uv/);
 - a trusted project directory for `LONGRUN_ALLOWED_ROOTS`.
 
@@ -159,9 +221,8 @@ virtual environment.
 Clone the repository and install the locked runtime:
 
 ```bash
-git clone https://github.com/woffko/codex-mcp-longrun.git
+git clone --branch main https://github.com/woffko/codex-mcp-longrun.git
 cd codex-mcp-longrun
-git switch experimental
 ./scripts/install-runtime.sh
 ```
 
@@ -188,7 +249,7 @@ The configuration script:
 - refuses to overwrite an existing `mcp_servers.longrun` entry;
 - creates a timestamped private backup under `~/.codex/backups`;
 - keeps the MCP optional with `required = false`;
-- allows only `health`, `start_job`, `get_job`, `cancel_job`, `run_and_wait`, and `read_log_tail`;
+- allows only `health`, `start_job`, `get_job`, `cancel_wakeup`, `cancel_job`, `run_and_wait`, and `read_log_tail`;
 - forwards `LONGRUN_BRIDGE_SOCKET` only when the opt-in launcher sets it;
 - configures command start, cancellation, and log reads to require approval;
 - keeps bounded metadata-only `get_job` reads automatic;
@@ -199,19 +260,10 @@ The configuration script:
   64 KiB by default;
 - gives Codex a tool timeout slightly longer than the server's 12-hour limit.
 
-Start a new Codex process after configuration. Existing on-screen processes do
-not hot-load new MCP servers. Use the `codex-longrun` commands in the next
-section for event-driven Goal wakeup. Ordinary Codex can still resume the same
-saved session in manual fallback mode:
-
-```bash
-cd /absolute/path/to/project
-codex resume SESSION_ID
-```
-
-Changing the shell directory first is important for project-scoped
-`.codex/config.toml` discovery. Do not assume that a later Codex `-C` option
-retroactively changes which configuration layers were loaded.
+After configuration, close the current Codex process and use the
+[bridge launcher commands below](#start-a-session-through-the-bridge).
+Existing processes do not hot-load the updated runtime or MCP configuration.
+Starting ordinary `codex` does not start the bridge.
 
 Verify registration:
 
@@ -230,31 +282,51 @@ available without changing allowed roots or unrelated Codex settings:
 ./scripts/install-runtime.sh
 ```
 
-## Event-driven Goal launcher
+## Start a session through the bridge
 
-Use `codex-longrun` instead of `codex` for sessions that should suspend a Goal
-without model-visible polling. This is the recommended workflow on the
-`experimental` branch:
+After installing Longrun and enrolling the exact project root, launch Codex
+through `codex-longrun` for automatic continuation with or without a Goal.
+Use the full installed path; adding the launcher to `PATH` is optional.
+Replace the quoted project path and, when resuming, the session ID.
+
+Start a new session:
 
 ```bash
-~/.local/share/codex-longrun-mcp/.venv/bin/codex-longrun \
-  -C /absolute/path/to/project
-
-~/.local/share/codex-longrun-mcp/.venv/bin/codex-longrun \
-  resume -C /absolute/path/to/project SESSION_ID
+"$HOME/.local/share/codex-longrun-mcp/.venv/bin/codex-longrun" \
+  -C "/absolute/path/to/project"
 ```
 
-The launcher starts the unmodified official `codex app-server`, a same-user
-Goal bridge, a bounded TUI compatibility proxy on private Unix sockets, and the
-official TUI in `--remote` mode. It does not build or replace Codex. Ordinary
-`codex` commands retain the manual two-turn behavior.
+Resume a saved session in that project, after closing its old Codex process:
+
+```bash
+"$HOME/.local/share/codex-longrun-mcp/.venv/bin/codex-longrun" \
+  resume -C "/absolute/path/to/project" "SESSION_ID"
+```
+
+Omit `SESSION_ID` from the second command to open the session picker. Keep the
+launcher running while jobs are pending. Do not start a second writer for an
+already active session or expect automatic wakeup after closing the launcher.
+
+In the launched session, check `longrun.health`: the exact project must be in
+`allowed_roots`, and `bridge_configured` and `bridge_reachable` must be true.
+Without a pending Goal, also require `session_wakeup_supported=true` and use
+`start_job(wake_policy="session")`. An active Goal keeps `wake_policy="goal"`.
+`auto` selects the applicable mode; it never bypasses a paused or limited Goal.
+See [session continuation](docs/SESSION_WAKEUP.md) and the
+[Goal contract](docs/GOAL_LONGRUN_CONTRACT.md) for the respective handoff behavior.
+
+The launcher starts the unmodified official `codex app-server`, a coordinator
+containing the bridge and bounded TUI compatibility proxy, and the official TUI
+in `--remote` mode. Private Unix sockets connect them. Starting only the
+`codex-mcp-longrun` MCP executable does not launch this client-side bridge.
+Ordinary `codex` remains available for explicit manual operation.
 
 The launcher resolves Codex `-C`/`--cd` before starting App Server and starts
 both App Server and the remote TUI with that real process working directory.
 This ensures that project-scoped `.codex/config.toml` is loaded even when
 `codex-longrun` itself was invoked from another directory.
 
-On Linux/WSL, App Server, the Goal bridge, and the TUI proxy run below isolated
+On Linux/WSL, App Server and the coordinator run below isolated
 supervisors. Each supervisor combines kernel parent-death delivery with a
 launcher-owned pipe, then terminates the daemon's complete process group with
 `SIGTERM` and bounded `SIGKILL` escalation. The interactive TUI keeps its
@@ -262,6 +334,12 @@ controlling terminal and uses a lighter exec guard. Every guard rechecks PPID
 after arming to close the fork-to-arm race. This prevents a Node shim or native
 App Server from surviving its launcher and retaining a thread-store writer
 lock; normal exits still use the launcher's graceful `finally` cleanup first.
+
+The launcher prefers `XDG_RUNTIME_DIR` for its private socket directory. If the
+variable is unset or points to a nonexistent stale path, as can happen in a WSL
+shell that was not registered as a logind session, it safely falls back to a
+fresh mode-`0700` directory under `/tmp`. An existing configured runtime
+directory is still rejected unless it is private and owned by the current user.
 
 ### Large Legacy session compatibility
 
@@ -334,6 +412,13 @@ automatically; resume the Goal manually in that case.
 
 ### Copy-paste automatic Goal contract
 
+For execution instructions in new Goals and existing sessions, use the
+[durable Goal contract](docs/GOAL_LONGRUN_CONTRACT.md). It requires a live Goal
+and a configured bridge before submission, explicitly rules out `auto`/`none`
+fallbacks for automatic execution, and explains how to attach instructions to
+an existing session without replacing its Goal or invalidating a pending wake
+lease. Replacing a Goal objective resets its usage accounting.
+
 Replace the placeholders and start Codex through `codex-longrun` first:
 
 ```text
@@ -392,7 +477,7 @@ Codex agents performing a session or project integration should follow the
 
 ## Fallback and compatibility workflows
 
-The automatic Goal contract above is the primary `experimental` workflow. Use
+For Goal-driven work, the automatic Goal contract above is the primary workflow. Use
 the alternatives in this section only when the session was started with
 ordinary `codex`, automatic wakeup setup failed before command start, or a
 specific client has already been verified for one blocking MCP call. Do not

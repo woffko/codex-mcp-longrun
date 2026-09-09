@@ -54,7 +54,7 @@ enabled = true
 required = false
 startup_timeout_sec = 20
 tool_timeout_sec = 43500
-enabled_tools = ["health", "start_job", "get_job", "cancel_job", "run_and_wait", "read_log_tail"]
+enabled_tools = ["health", "start_job", "get_job", "cancel_wakeup", "cancel_job", "run_and_wait", "read_log_tail"]
 default_tools_approval_mode = "prompt"
 env_vars = [{forwarded_toml}{', ' if forwarded_toml else ''}"LONGRUN_BRIDGE_SOCKET"]
 
@@ -84,6 +84,9 @@ approval_mode = "prompt"
 approval_mode = "auto"
 
 [mcp_servers.longrun.tools.cancel_job]
+approval_mode = "prompt"
+
+[mcp_servers.longrun.tools.cancel_wakeup]
 approval_mode = "prompt"
 
 [mcp_servers.longrun.tools.run_and_wait]

@@ -33,7 +33,11 @@ class GoalBridge:
         )
         self.server: asyncio.AbstractServer | None = None
         self._thread_events: dict[str, asyncio.Event] = {}
-        self._expected_goal_status: dict[str, str] = {}
+        # Track the exact Goal revision produced by a bridge-owned status
+        # change. A later user change to the same status (for example, an
+        # explicit pause while a job is running) must not be mistaken for our
+        # own update.
+        self._expected_goal_status: dict[str, tuple[str, int | None]] = {}
         self._delivery_tasks: dict[str, asyncio.Task[None]] = {}
         self._deadline_tasks: dict[str, asyncio.Task[None]] = {}
 
@@ -168,7 +172,7 @@ class GoalBridge:
             goal_updated_at=updated_at,
             deadline_at=time.time() + timeout_sec + grace_period_sec + 60,
         )
-        self._expected_goal_status[thread_id] = "paused"
+        self._expected_goal_status[thread_id] = ("paused", updated_at)
         try:
             paused_result = await self.app.call(
                 "thread/goal/set", {"threadId": thread_id, "status": "paused"}
@@ -176,10 +180,14 @@ class GoalBridge:
             paused = self._goal_from_result(paused_result)
             if not self._same_goal(lease, paused) or paused.get("status") != "paused":
                 raise RuntimeError("Goal identity changed while the wake lease was being armed")
+            paused_updated_at = paused.get("updatedAt")
+            if not isinstance(paused_updated_at, int):
+                raise RuntimeError("App Server returned incomplete paused Goal revision")
+            self._expected_goal_status[thread_id] = ("paused", paused_updated_at)
             self.state.update(
                 job_id,
                 state="armed",
-                goal_updated_at=int(paused.get("updatedAt", updated_at)),
+                goal_updated_at=paused_updated_at,
             )
         except Exception as exc:
             self._expected_goal_status.pop(thread_id, None)
@@ -271,7 +279,10 @@ class GoalBridge:
                 )
                 return
             self.state.update(lease.job_id, delivery_state="activating")
-            self._expected_goal_status[lease.thread_id] = "active"
+            # The App Server may emit the notification before or after the
+            # response. During this one status change, status is sufficient;
+            # user changes to paused still do not match it.
+            self._expected_goal_status[lease.thread_id] = ("active", None)
             try:
                 activated_result = await self.app.call(
                     "thread/goal/set", {"threadId": lease.thread_id, "status": "active"}
@@ -297,6 +308,15 @@ class GoalBridge:
                     error="App Server did not confirm Goal activation",
                 )
                 return
+            if not isinstance(activated.get("updatedAt"), int):
+                self.state.update(
+                    lease.job_id,
+                    state="failed",
+                    delivery_state="needs_manual_recovery",
+                    error="App Server returned incomplete active Goal revision",
+                )
+                return
+            self._expected_goal_status.pop(lease.thread_id, None)
             self.state.update(lease.job_id, state="delivered", delivery_state="resumed")
         except asyncio.CancelledError:
             raise
@@ -360,13 +380,20 @@ class GoalBridge:
             return
         expected = self._expected_goal_status.get(thread_id)
         if expected is not None:
-            if goal.get("status") == expected:
+            expected_status, expected_updated_at = expected
+            if goal.get("status") == expected_status and (
+                expected_updated_at is None or goal.get("updatedAt") == expected_updated_at
+            ):
                 self._expected_goal_status.pop(thread_id, None)
-            return
+                return
         lease = self.state.live_for_thread(thread_id)
         if lease is None:
             return
-        if not self._same_goal(lease, goal) or goal.get("status") != "paused":
+        if (
+            not self._same_goal(lease, goal)
+            or goal.get("status") != "paused"
+            or goal.get("updatedAt") != lease.goal_updated_at
+        ):
             self._abandon_for_manual_change(thread_id, "Goal was changed outside the bridge")
 
     def _abandon_for_manual_change(self, thread_id: str, reason: str) -> None:
