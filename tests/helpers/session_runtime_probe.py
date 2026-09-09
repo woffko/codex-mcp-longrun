@@ -32,7 +32,8 @@ async def probe(args: argparse.Namespace) -> None:
     requests: list[dict] = []
     events: list[dict] = []
     seed_mode = args.resume
-    goal_mode = args.policy == "goal"
+    goal_mode = args.existing_goal == "active" if args.existing_goal is not None else args.policy == "goal"
+    original_goal = None
     goal_job_id = None
     goal_completed = threading.Event()
     code = "import time,sys; time.sleep(1); print('SESSION_JOB_OK'); sys.exit(" + ("7" if args.outcome == "failure" else "0") + ")"
@@ -281,6 +282,9 @@ LONGRUN_BRIDGE_SOCKET = {json.dumps(str(bridge_socket))}
             await call("thread/unsubscribe", {"threadId": thread_id})
             await call("thread/resume", {"threadId": thread_id, "excludeTurns": True})
         assert (await call("thread/goal/get", {"threadId": thread_id}))["goal"] is None
+        if args.existing_goal in {"paused", "blocked", "complete"}:
+            original_goal = (await call("thread/goal/set", {"threadId": thread_id,
+                "objective": "Keep this unrelated inactive Goal unchanged.", "status": args.existing_goal}))["goal"]
         if goal_mode:
             test_goal = (await call("thread/goal/set", {"threadId": thread_id,
                 "objective": "Complete the isolated Longrun Goal wakeup test.", "status": "active"}))["goal"]
@@ -340,6 +344,7 @@ LONGRUN_BRIDGE_SOCKET = {json.dumps(str(bridge_socket))}
         assert job_result and job_result["state"] == expected and job_result["terminal"], job_result
         assert job_result["tail"].strip() == ("" if args.outcome == "timeout" else "SESSION_JOB_OK"), job_result
         if goal_mode:
+            assert job_result["wake_mode"] == "goal"
             assert len(requests) == 4, len(requests)
             final_goal = (await call("thread/goal/get", {"threadId": thread_id}))["goal"]
             assert final_goal["status"] == "complete" and final_goal["objective"] == test_goal["objective"]
@@ -354,17 +359,19 @@ LONGRUN_BRIDGE_SOCKET = {json.dumps(str(bridge_socket))}
             finished = datetime.fromisoformat(job_result["finished_at_utc"]).timestamp()
             delay = activated - finished
             assert -.1 <= delay < 10, delay
-            print(json.dumps({"result": "PASS", "policy": "goal", "normal_terminal": terminal,
+            print(json.dumps({"result": "PASS", "policy": args.policy, "wake_mode": "goal", "normal_terminal": terminal,
                               "activation_delay_sec": round(delay, 3), "turns": statuses, "artifacts": str(root)}))
             return
         assert len(requests) == (5 if args.chain else 3), len(requests)
+        assert job_result["wake_mode"] == "session"
         before_wake = requests[-2]["input"]
         assert any(x.get("role") == "developer" and "[Longrun session handoff]" in json.dumps(x)
                    and job_result["job_id"] in json.dumps(x) for x in before_wake)
         outputs = [x for x in before_wake if x.get("call_id") == "start_call_1" and x.get("type") == "custom_tool_call_output"]
         assert outputs and "HANDOFF_MUST_NOT_RETURN" not in json.dumps(outputs), outputs
-        assert (await call("thread/goal/get", {"threadId": thread_id}))["goal"] is None
-        print(json.dumps({"result": "PASS", "resume": args.resume, "policy": args.policy, "outcome": args.outcome, "chain": args.chain,
+        assert (await call("thread/goal/get", {"threadId": thread_id}))["goal"] == original_goal
+        print(json.dumps({"result": "PASS", "resume": args.resume, "policy": args.policy, "wake_mode": "session",
+                          "existing_goal": args.existing_goal, "goal_unchanged": True, "outcome": args.outcome, "chain": args.chain,
                           "thread_id": thread_id, "turns": statuses, "job_id": job_result["job_id"], "artifacts": str(root)}))
     finally:
         (root / "events.json").write_text(json.dumps(events, indent=2))
@@ -393,6 +400,8 @@ if __name__ == "__main__":
     parser.add_argument("--codex", default=shutil.which("codex"))
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--policy", choices=("session", "auto", "goal"), default="session")
+    parser.add_argument("--existing-goal", choices=("none", "active", "paused", "blocked", "complete"),
+                        help="Override the synthetic Goal setup to test routing independently of the caller hint")
     parser.add_argument("--outcome", choices=("success", "failure", "timeout"), default="success")
     parser.add_argument("--user-activity", action="store_true")
     parser.add_argument("--chain", action="store_true")
@@ -404,10 +413,13 @@ if __name__ == "__main__":
     options = parser.parse_args()
     if not 0 <= options.goal_final_delay <= 5:
         parser.error("--goal-final-delay must be between 0 and 5 seconds")
-    if options.goal_user_pause and options.policy != "goal":
+    goal_probe = options.existing_goal == "active" if options.existing_goal is not None else options.policy == "goal"
+    if options.goal_user_pause and not goal_probe:
         parser.error("--goal-user-pause requires --policy goal")
-    if options.policy == "goal" and (options.tui or options.launcher or options.user_activity or options.chain or options.resume):
+    if goal_probe and (options.tui or options.launcher or options.user_activity or options.chain or options.resume):
         parser.error("the Goal probe uses its own isolated protocol lifecycle; combine only with --outcome/--installed")
+    if options.existing_goal is not None and (options.tui or options.launcher or options.user_activity):
+        parser.error("--existing-goal is supported by the protocol probe only")
     if options.launcher:
         options.tui = True
     asyncio.run(asyncio.wait_for(probe(options), 25))

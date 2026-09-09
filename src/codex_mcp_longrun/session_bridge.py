@@ -43,6 +43,7 @@ class SessionBridge(GoalBridge):
         if request.get("action") == "health":
             return {"ok": True, "version": PROTOCOL_VERSION,
                     "session_wakeup_supported": True,
+                    "state_based_routing": True,
                     "session_transport_ready": bool(self.peers)}
         if request.get("action") in {"handoff", "cancel_wakeup", "wake_status"}:
             job_id = self._job_id(request.get("job_id"))
@@ -145,19 +146,18 @@ class SessionBridge(GoalBridge):
 
     async def _prepare(self, job_id: str, request: dict[str, Any]) -> dict[str, Any]:
         policy = request.get("wake_policy", "goal")
-        if policy == "goal":
-            return await super()._prepare(job_id, request)
-        if policy not in {"auto", "session"}:
+        if policy not in {"auto", "goal", "session"}:
             raise ValueError("invalid wake policy")
         thread_id = self._thread_id(request.get("thread_id"))
         result = await self.app.call("thread/goal/get", {"threadId": thread_id})
         if not isinstance(result, dict) or "goal" not in result:
             raise RuntimeError("cannot establish Goal state")
         goal = result["goal"]
-        if isinstance(goal, dict) and goal.get("status") == "active" and policy == "auto":
-            return await super()._prepare(job_id, request)
-        if goal is not None and (not isinstance(goal, dict) or goal.get("status") != "complete"):
-            raise RuntimeError("session wakeup requires no Goal or a completed Goal; paused Goals are not bypassed")
+        if isinstance(goal, dict) and goal.get("status") == "active":
+            result = await super()._prepare(job_id, request)
+            return {**result, "wake_mode": "goal", "state_based_routing": True}
+        if goal is not None and (not isinstance(goal, dict) or goal.get("status") not in {"paused", "blocked", "complete"}):
+            raise RuntimeError("state-based routing cannot bypass Goal usage/budget limits or an unknown Goal state")
         call_id = request.get("call_id")
         if not isinstance(call_id, str) or not 1 <= len(call_id) <= 256:
             raise RuntimeError("session wakeup requires trusted MCP call metadata")
@@ -206,6 +206,7 @@ class SessionBridge(GoalBridge):
             self.lease_peers[job_id] = peer
             self._schedule_deadline(self.state.get(job_id) or lease)
             return {"ok": True, "automatic_wakeup": True, "wake_mode": "session",
+                    "state_based_routing": True,
                     "thread_id": thread_id, "turn_id": turn_id}
         return await peer.exclusive(prepare)
 

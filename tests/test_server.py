@@ -66,7 +66,7 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
                 health = await asyncio.wait_for(session.call_tool("health", {}), 5)
 
         self.assertEqual(initialized.server_info.name, "codex-longrun")
-        self.assertEqual(initialized.server_info.version, "0.4.0a11")
+        self.assertEqual(initialized.server_info.version, "0.4.0a12")
         self.assertIn("wake_policy='goal'", initialized.instructions or "")
         self.assertIn("collaboration.wait_agent", initialized.instructions or "")
         self.assertIn("wake_policy='none' only", initialized.instructions or "")
@@ -88,7 +88,7 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("stdin_secret_ids", start_tool.input_schema.get("properties", {}))
         self.assertFalse(health.is_error)
         self.assertTrue(health.structured_content["ok"])
-        self.assertEqual(health.structured_content["server_version"], "0.4.0a11")
+        self.assertEqual(health.structured_content["server_version"], "0.4.0a12")
         self.assertEqual(health.structured_content["heartbeat_initial_sec"], 1)
         self.assertEqual(health.structured_content["heartbeat_interval_sec"], 2)
         self.assertEqual(health.structured_content["max_active_jobs"], 4)
@@ -182,6 +182,24 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([request["action"] for request in requests], ["prepare", "terminal"])
         self.assertTrue(all(request["thread_id"] == thread_id for request in requests))
         self.assertEqual(requests[1]["terminal_state"], "succeeded")
+
+    async def test_state_router_may_resolve_session_hint_to_goal_only_when_advertised(self) -> None:
+        from types import SimpleNamespace
+        context = SimpleNamespace(request_context=SimpleNamespace(meta={"threadId": "routing-test", "callId": "call-test"}))
+        for advertised in (False, True):
+            async def reply(_socket, request, **kwargs):
+                if request["action"] == "health":
+                    return {"ok": True, "session_wakeup_supported": True}
+                return {"ok": True, "automatic_wakeup": True, "wake_mode": "goal", "state_based_routing": advertised}
+            with patch.object(server, "BRIDGE_SOCKET", "/tmp/routing-test.sock"), patch.object(server, "request_bridge", AsyncMock(side_effect=reply)):
+                if advertised:
+                    registration, _ = await server._prepare_wake_registration(
+                        job_id="a" * 32, ctx=context, wake_policy="session", timeout_sec=5, grace_period_sec=1)
+                    self.assertEqual(registration.wake_mode, "goal")
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "incompatible"):
+                        await server._prepare_wake_registration(
+                            job_id="a" * 32, ctx=context, wake_policy="session", timeout_sec=5, grace_period_sec=1)
 
     async def test_01a_async_secret_stdin_reaches_child_with_suppressed_output(self) -> None:
         secret = b"async-fixture-password\n"

@@ -44,7 +44,7 @@ from .secret_input import (
 
 
 SERVER_NAME = "Codex MCP Longrun"
-SERVER_VERSION = "0.4.0a11"
+SERVER_VERSION = "0.4.0a12"
 DEFAULT_MAX_LOG_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_TIMEOUT_SEC = 12 * 60 * 60
 DEFAULT_HEARTBEAT_INITIAL_SEC = 0
@@ -350,8 +350,12 @@ MCP_INSTRUCTIONS = (
     "tool after that receipt does not mean startup failed; never duplicate the job. Invoke start_job "
     "in its own functions.exec call, with no parallel or following work. The terminal event starts one "
     "continuation in the same session; get_job once and continue the task. New user input or stop "
-    "cancels pending session wakeup without killing the job. Paused, blocked, and limited Goals are "
-    "never bypassed. cancel_wakeup cancels only a session wake; cancel_job requires "
+    "cancels pending session wakeup without killing the job. When health.state_based_routing=true, "
+    "auto/goal/session are routing hints: an active Goal uses Goal continuation; paused, blocked, complete, "
+    "or absent Goals use session continuation without changing the Goal. Prefer auto in this experiment. "
+    "No separate outside-Goal permission is needed for work already requested by the user. Usage/budget-limited "
+    "Goals remain protected. Existing wake leases keep their mode; later Goal changes still revoke them. "
+    "cancel_wakeup cancels only a session wake; cancel_job requires "
     "approval. run_and_wait is a legacy "
     "compatibility tool because some Codex runtimes turn a pending tool call into model-driven waits. "
     "Pass argv as an array and cwd as an absolute path. Never place a secret value in argv, MCP arguments, "
@@ -395,6 +399,7 @@ class HealthResult(BaseModel):
     bridge_reachable: bool = False
     session_wakeup_supported: bool = False
     session_transport_ready: bool = False
+    state_based_routing: bool = False
     secret_stdin_supported: bool
     secret_stdin_pair_supported: bool
     secret_ttl_sec: int
@@ -753,7 +758,9 @@ async def _prepare_wake_registration(
     if response.get("automatic_wakeup") is not True:
         raise RuntimeError("Bridge did not confirm automatic wakeup")
     mode = response.get("wake_mode", "goal")
-    if mode not in {"session", "goal"} or (wake_policy == "session" and mode != "session"):
+    if mode not in {"session", "goal"} or (
+        wake_policy == "session" and mode != "session" and response.get("state_based_routing") is not True
+    ):
         raise RuntimeError("Bridge returned an incompatible wake mode")
     return WakeRegistration(socket_path=BRIDGE_SOCKET, thread_id=thread_id, wake_mode=mode), "armed"
 
@@ -1248,6 +1255,7 @@ async def health() -> HealthResult:
         bridge_reachable=bridge_health.get("ok") is True,
         session_wakeup_supported=bridge_health.get("session_wakeup_supported") is True,
         session_transport_ready=bridge_health.get("session_transport_ready") is True,
+        state_based_routing=bridge_health.get("state_based_routing") is True,
         secret_stdin_supported=True,
         secret_stdin_pair_supported=hasattr(os, "memfd_create"),
         secret_ttl_sec=SECRET_TTL_SEC,
@@ -1684,9 +1692,10 @@ async def start_job(
         WakePolicy,
         Field(
             description=(
-                "auto selects Goal or session continuation with a configured bridge; goal requires an active Goal; "
-                "session requires the codex-longrun coordinator and yields by interrupting this tool transport "
-                "after a durable startup receipt. none returns without automatic wakeup."
+                "Experimental coordinator routing: auto/goal/session select Goal continuation when the Goal "
+                "is active, or session continuation when it is paused, blocked, complete, or absent. "
+                "Session continuation interrupts this transport after a durable startup receipt and does not "
+                "reactivate an inactive Goal. Usage/budget limits remain protected. none disables wakeup."
             )
         ),
     ] = "auto",

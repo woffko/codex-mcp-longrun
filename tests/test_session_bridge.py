@@ -146,26 +146,33 @@ class SessionBridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.terminal()
         self.assertEqual(self.peer.wakes, 0)
 
-    async def test_goal_pauses_and_other_goal_states_are_not_bypassed(self):
-        for status in ("paused", "blocked", "budgetLimited", "active", "unknown"):
-            for policy in ("session", "auto"):
-                if status == "active" and policy == "auto":
-                    continue  # Covered by the existing Goal lifecycle tests below.
+    async def test_goal_limits_and_unknown_states_are_not_bypassed(self):
+        for status in ("budgetLimited", "usageLimited", "unknown"):
+            for policy in ("session", "auto", "goal"):
                 self.peer.goal = {"status": status}
-                with self.subTest(status=status, policy=policy), self.assertRaisesRegex(RuntimeError, "paused Goals"):
+                with self.subTest(status=status, policy=policy), self.assertRaisesRegex(RuntimeError, "limits"):
                     await self.bridge._dispatch({**self.request, "wake_policy": policy})
         self.assertIsNone(self.bridge.state.get(self.job))
 
-    async def test_auto_uses_session_for_absent_or_complete_goal(self):
-        for goal in (None, {"status": "complete", "objective": "old task"}):
-            self.peer.goal = goal
-            self.request["job_id"] = uuid.uuid4().hex
-            self.job = self.request["job_id"]
-            self.request["wake_policy"] = "auto"
-            result = await self.prepare()
-            self.assertEqual(result["wake_mode"], "session")
-            self.bridge.user_activity(self.thread)
-            self.assertEqual(self.peer.goal, goal)
+    async def test_all_hints_use_session_for_absent_or_inactive_goal(self):
+        for status in (None, "complete", "paused", "blocked"):
+            for policy in ("auto", "goal", "session"):
+                goal = None if status is None else {"status": status, "objective": "old task", "updatedAt": 12}
+                self.peer.goal = goal
+                original = json.dumps(goal, sort_keys=True)
+                self.request["job_id"] = self.job = uuid.uuid4().hex
+                self.request["wake_policy"] = policy
+                self.peer.turn = {"id": str(uuid.uuid4()), "status": "inProgress"}
+                with self.subTest(status=status, policy=policy):
+                    result = await self.prepare()
+                    self.assertEqual(result["wake_mode"], "session")
+                    self.assertTrue(result["state_based_routing"])
+                    await self.handoff()
+                    await self.terminal()
+                    await self.delivery()
+                    self.assertEqual(self.bridge.state.get(self.job).delivery_state, "resumed")
+                    self.assertEqual(json.dumps(self.peer.goal, sort_keys=True), original)
+                    self.assertNotIn("thread/goal/set", [method for method, _ in self.peer.calls])
 
     async def test_goal_created_while_waiting_prevents_wake(self):
         await self.prepare()
@@ -276,6 +283,14 @@ class GoalCompatibilityTests(goal_tests.BridgeTests):
         self.assertTrue(result["automatic_wakeup"])
         self.assertEqual(self.fake.goal["status"], "paused")
         self.assertNotIn("turn/interrupt", [m for m, _ in self.fake.calls])
+
+    async def test_session_hint_with_active_goal_uses_goal_mode(self):
+        result = await self.bridge._dispatch({"version": 1, "action": "prepare", "job_id": uuid.uuid4().hex,
+                                             "thread_id": self.thread_id, "timeout_sec": 30,
+                                             "grace_period_sec": 1, "wake_policy": "session"})
+        self.assertEqual(result["wake_mode"], "goal")
+        self.assertTrue(result["state_based_routing"])
+        self.assertEqual(self.fake.goal["status"], "paused")
 
 
 class StateUpgradeTests(unittest.TestCase):

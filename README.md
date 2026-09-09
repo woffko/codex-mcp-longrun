@@ -31,12 +31,20 @@ The project is currently a Linux/WSL pilot, not a production release.
 
 > [!IMPORTANT]
 > This README describes the `experimental` branch and package version
-> `0.4.0a11`. Use `start_job(wake_policy="goal")` for active Goals and
-> `start_job(wake_policy="session")` without a pending Goal. With the launcher,
-> `auto` selects the applicable mode. The manual Goal and blocking workflows are
+> `0.4.0a12`. This experimental version selects continuation from the Goal state:
+> an active Goal uses Goal wakeup; paused, blocked, completed, or absent Goals
+> use session wakeup without changing the Goal. Prefer `wake_policy="auto"`.
+> `goal` and `session` are also routed by state in this experiment. The manual Goal and blocking workflows are
 > compatibility fallbacks and must not be combined with automatic wakeup.
 
 ## Why use it
+
+The `0.4.0a12` experiment removes the extra outside-Goal approval step for an
+already requested task when the existing Goal is paused or blocked. Check
+`health.state_based_routing=true` to identify this coordinator behavior.
+Usage/budget limits remain protected, and `wake_policy="none"` remains manual.
+Routing is selected once per new job; a later user/Goal change can still revoke
+its pending wake. The stable `main` branch retains its previous routing policy.
 
 Version `0.4.0a11` fixes a Goal pause-notification race that could discard the
 normal completion event and defer wakeup until the job's safety deadline.

@@ -1,20 +1,27 @@
-# Session continuation without a Goal
+# Experimental continuation by Goal state
 
 Requires the updated `codex-longrun` launcher. Runtime acceptance was performed
 with Codex 0.153.4. Ordinary `codex` still has no wake coordinator.
 
 | Policy | Behavior |
 | --- | --- |
-| `goal` | Requires an active Goal; preserves the existing Goal pause/resume contract |
-| `session` | Requires no Goal or a completed Goal and one owning TUI connection |
-| `auto` | Uses Goal mode for an active Goal, otherwise session mode when eligible |
+| `auto`, `goal`, `session` | Active Goal uses Goal continuation; paused, blocked, completed, or absent Goal uses session continuation |
 | `none` | Explicit manual operation; no automatic wakeup |
 
 With a configured bridge, registration errors fail before command startup.
-Paused, blocked, usage-limited, and budget-limited Goals are never bypassed by
-session mode. A completed Goal remains complete, with its objective and usage
-unchanged. Without a bridge, `auto` retains the manual fallback; explicit
+In this `experimental` branch trial, a paused or blocked (stalled) Goal does not
+prevent an already-authorized task from using session continuation. Its status,
+objective, and usage remain unchanged. Usage-limited and budget-limited Goals
+still stop automatic registration. Unknown/malformed Goal states also fail.
+Without a bridge, `auto` retains the manual fallback; explicit
 `session` and `goal` fail before startup.
+
+`health.state_based_routing=true` advertises this behavior; stable coordinators
+retain their previous policy. `wake_policy` records the caller's hint and
+`wake_mode` records the actual continuation mechanism. Selection happens at
+registration; changing the Goal later still cancels the pending wake rather
+than migrating an already registered job. No existing Goal is automatically
+reactivated merely to enable a separate session task.
 
 ## Handoff
 
@@ -76,14 +83,18 @@ command output or secret stdin data.
 
 ## Agent contract
 
-When no Goal is pending, use `start_job(wake_policy="session")` through a verified
+With this experimental coordinator, prefer `start_job(wake_policy="auto")`. An
+active Goal follows the Goal mechanism; a paused, blocked, completed, or absent
+Goal follows session continuation. Use a verified
 `codex-longrun` coordinator, in its own executor call. Allow the coordinator to
 end the turn. Do not poll, wait, or submit duplicate commands. On its completion
 wake, call `get_job` once and continue the user's task. New user instructions take
 precedence. Never create or reactivate a Goal merely to obtain wakeup. If handoff
 fails after startup, use the reported job ID for recovery; do not rerun the command.
 
-For active Goals, keep [the Goal contract](GOAL_LONGRUN_CONTRACT.md) unchanged.
+For active Goals, [the Goal contract](GOAL_LONGRUN_CONTRACT.md) still applies;
+its explicit `goal` hint selects the same Goal mechanism. A paused/blocked Goal
+does not require separate permission to run a task the user already requested.
 
 ## Validation
 
@@ -100,6 +111,9 @@ model; it needs no API key or external model service:
 .venv/bin/python tests/helpers/session_runtime_probe.py --outcome timeout
 .venv/bin/python tests/helpers/session_runtime_probe.py --user-activity
 .venv/bin/python tests/helpers/session_runtime_probe.py --chain
+.venv/bin/python tests/helpers/session_runtime_probe.py --policy auto --existing-goal paused
+.venv/bin/python tests/helpers/session_runtime_probe.py --policy goal --existing-goal blocked --chain
+.venv/bin/python tests/helpers/session_runtime_probe.py --policy session --existing-goal active
 .venv/bin/python tests/helpers/session_runtime_probe.py --tui
 # Verify the installed package through the actual launcher and remote TUI:
 ~/.local/share/codex-longrun-mcp/.venv/bin/python \

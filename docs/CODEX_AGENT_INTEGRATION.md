@@ -136,10 +136,16 @@ appropriate instruction file without replacing existing content:
 
 - For reviewed, trusted, non-interactive commands expected to run longer than
   about 30 seconds, use `longrun.start_job` once when it is available.
+- When `health.state_based_routing=true`, prefer `wake_policy="auto"`: the
+  experimental coordinator uses Goal continuation for an active Goal, or
+  session continuation for a paused, blocked, completed, or absent Goal.
+  `goal`/`session` hints follow that same routing. Do not request extra outside-
+  Goal permission for work the user already authorized. Keep inactive Goals
+  unchanged and respect usage/budget limits. See `docs/SESSION_WAKEUP.md`.
 - Pass the command as an argument array and use this project's absolute root as
   `cwd`. Report the returned job ID and end the turn without polling.
-- Claim automatic wakeup only when Codex was launched through `codex-longrun`,
-  `wake_policy="goal"` was requested, and the result says
+- For Goal continuation, claim automatic wakeup only when Codex was launched through `codex-longrun`,
+  Goal mode was selected, and the result says
   `automatic_wakeup=true`. In that mode the bridge owns pause/resume; end the
   submission turn immediately and call `longrun.get_job` exactly once only in
   the automatically resumed turn. Otherwise use `longrun.get_job` once in a
