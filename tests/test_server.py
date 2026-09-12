@@ -66,7 +66,7 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
                 health = await asyncio.wait_for(session.call_tool("health", {}), 5)
 
         self.assertEqual(initialized.server_info.name, "codex-longrun")
-        self.assertEqual(initialized.server_info.version, "0.4.0a12")
+        self.assertEqual(initialized.server_info.version, "0.4.0a13")
         self.assertIn("wake_policy='goal'", initialized.instructions or "")
         self.assertIn("collaboration.wait_agent", initialized.instructions or "")
         self.assertIn("wake_policy='none' only", initialized.instructions or "")
@@ -88,7 +88,7 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("stdin_secret_ids", start_tool.input_schema.get("properties", {}))
         self.assertFalse(health.is_error)
         self.assertTrue(health.structured_content["ok"])
-        self.assertEqual(health.structured_content["server_version"], "0.4.0a12")
+        self.assertEqual(health.structured_content["server_version"], "0.4.0a13")
         self.assertEqual(health.structured_content["heartbeat_initial_sec"], 1)
         self.assertEqual(health.structured_content["heartbeat_interval_sec"], 2)
         self.assertEqual(health.structured_content["max_active_jobs"], 4)
@@ -180,6 +180,7 @@ class LongrunTests(unittest.IsolatedAsyncioTestCase):
 
         requests = [call.args[1] for call in mocked.await_args_list]
         self.assertEqual([request["action"] for request in requests], ["prepare", "terminal"])
+        self.assertEqual(mocked.await_args_list[0].kwargs["timeout_sec"], server.PREPARE_REQUEST_TIMEOUT_SEC)
         self.assertTrue(all(request["thread_id"] == thread_id for request in requests))
         self.assertEqual(requests[1]["terminal_state"], "succeeded")
 

@@ -266,6 +266,41 @@ class SessionBridgeTests(unittest.IsolatedAsyncioTestCase):
             await self.bridge._dispatch({**self.request, "call_id": None})
         self.assertIsNone(self.bridge.state.get(self.job))
 
+    async def test_abort_during_slow_session_prepare_cannot_arm_late(self):
+        await self.observed()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_call = self.peer.call
+
+        async def delayed_call(method, params):
+            if method == "thread/turns/list":
+                entered.set()
+                await release.wait()
+            return await original_call(method, params)
+
+        self.peer.call = delayed_call
+        task = asyncio.create_task(self.bridge._dispatch(self.request))
+        await entered.wait()
+        lease = self.bridge.state.get(self.job)
+        self.assertIsNotNone(lease)
+        self.assertEqual(lease.state, "preparing")
+        aborted = await self.bridge._dispatch({**self.request, "action": "abort"})
+        self.assertEqual(aborted["delivery_state"], "abandoned")
+        release.set()
+        with self.assertRaisesRegex(RuntimeError, "revoked"):
+            await task
+        self.assertEqual(self.bridge.state.get(self.job).state, "abandoned")
+        self.assertNotIn(self.job, self.bridge.lease_peers)
+
+    async def test_abort_after_session_prepare_abandons_instead_of_goal_delivery(self):
+        original = json.dumps(self.peer.goal, sort_keys=True)
+        await self.prepare()
+        aborted = await self.bridge._dispatch({**self.request, "action": "abort"})
+        self.assertEqual(aborted["delivery_state"], "abandoned")
+        self.assertEqual(self.bridge.state.get(self.job).state, "abandoned")
+        self.assertNotIn(self.job, self.bridge._delivery_tasks)
+        self.assertEqual(json.dumps(self.peer.goal, sort_keys=True), original)
+
 
 class GoalCompatibilityTests(goal_tests.BridgeTests):
     """Run the unchanged Goal lifecycle assertions against the new coordinator."""

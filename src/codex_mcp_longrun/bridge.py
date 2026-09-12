@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+from contextvars import ContextVar
 import json
 import os
 import re
@@ -17,7 +18,12 @@ from pathlib import Path
 from typing import Any
 
 from .app_server_client import AppServerClient, AppServerError
-from .bridge_protocol import MAX_MESSAGE_BYTES, PROTOCOL_VERSION, peer_uid
+from .bridge_protocol import (
+    MAX_MESSAGE_BYTES,
+    PREPARE_HANDLER_TIMEOUT_SEC,
+    PROTOCOL_VERSION,
+    peer_uid,
+)
 from .bridge_state import BridgeState, WakeLease
 
 
@@ -44,6 +50,8 @@ class GoalBridge:
         self._goal_controls: dict[str, asyncio.Lock] = {}
         self._delivery_tasks: dict[str, asyncio.Task[None]] = {}
         self._deadline_tasks: dict[str, asyncio.Task[None]] = {}
+        self._connections: set[asyncio.Task[Any]] = set()
+        self._registration_stage: ContextVar[str] = ContextVar("registration_stage", default="validation")
 
     async def start(self) -> None:
         await self.app.connect()
@@ -72,6 +80,11 @@ class GoalBridge:
             self.server.close()
             await self.server.wait_closed()
             self.server = None
+        # Finish request cancellation while the database and App Server are live.
+        connections = list(self._connections)
+        for task in connections:
+            task.cancel()
+        await asyncio.gather(*connections, return_exceptions=True)
         tasks = [*self._delivery_tasks.values(), *self._deadline_tasks.values()]
         for task in tasks:
             task.cancel()
@@ -109,25 +122,56 @@ class GoalBridge:
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        owner = asyncio.current_task()
+        if owner is not None:
+            self._connections.add(owner)
+        children: list[asyncio.Task[Any]] = []
         try:
-            if peer_uid(writer) != os.getuid():
-                raise PermissionError("bridge accepts only same-user Unix peers")
-            line = await reader.readline()
-            if not line or len(line) > MAX_MESSAGE_BYTES or not line.endswith(b"\n"):
-                raise ValueError("invalid bridge request framing")
-            request = json.loads(line)
-            if not isinstance(request, dict):
-                raise ValueError("bridge request must be an object")
-            response = await self._dispatch(request)
-        except Exception as exc:
-            response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        encoded = json.dumps(response, separators=(",", ":"), ensure_ascii=True).encode() + b"\n"
-        writer.write(encoded[:MAX_MESSAGE_BYTES])
-        with contextlib.suppress(ConnectionError):
-            await writer.drain()
-        writer.close()
-        with contextlib.suppress(ConnectionError):
-            await writer.wait_closed()
+            try:
+                if peer_uid(writer) != os.getuid():
+                    raise PermissionError("bridge accepts only same-user Unix peers")
+                line = await reader.readline()
+                if not line or len(line) > MAX_MESSAGE_BYTES or not line.endswith(b"\n"):
+                    raise ValueError("invalid bridge request framing")
+                request = json.loads(line)
+                if not isinstance(request, dict):
+                    raise ValueError("bridge request must be an object")
+                if request.get("action") == "prepare":
+                    # Only setup belongs to this connection. Handoff/terminal
+                    # delivery must survive a caller losing its response.
+                    dispatch = asyncio.create_task(self._dispatch(request))
+                    disconnect = asyncio.create_task(reader.read(1))
+                    children = [dispatch, disconnect]
+                    done, _ = await asyncio.wait(children, return_when=asyncio.FIRST_COMPLETED)
+                    if disconnect in done:
+                        dispatch.cancel()
+                        await asyncio.gather(dispatch, return_exceptions=True)
+                        await self._abort(self._job_id(request.get("job_id")), request)
+                        if disconnect.result() != b"":
+                            raise ValueError("unexpected data after bridge request")
+                        return
+                    response = dispatch.result()
+                else:
+                    response = await self._dispatch(request)
+            except Exception as exc:
+                response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            encoded = json.dumps(response, separators=(",", ":"), ensure_ascii=True).encode() + b"\n"
+            writer.write(encoded[:MAX_MESSAGE_BYTES])
+            with contextlib.suppress(ConnectionError):
+                await writer.drain()
+        finally:
+            for child in children:
+                child.cancel()
+            await asyncio.gather(*children, return_exceptions=True)
+            writer.close()
+            with contextlib.suppress(ConnectionError):
+                await writer.wait_closed()
+            if owner is not None:
+                self._connections.discard(owner)
+
+    def _prepare_stage(self, job_id: str, stage: str) -> None:
+        self.state.check_registration(job_id)
+        self._registration_stage.set(stage)
 
     async def _dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
         if request.get("version") != PROTOCOL_VERSION:
@@ -137,7 +181,48 @@ class GoalBridge:
             return {"ok": True, "version": PROTOCOL_VERSION}
         job_id = self._job_id(request.get("job_id"))
         if action == "prepare":
-            return await self._prepare(job_id, request)
+            task = asyncio.current_task()
+            if task is None:
+                raise RuntimeError("wake registration requires an active asyncio task")
+            timed_out = False
+            stage_token = self._registration_stage.set("validation")
+            started = time.monotonic()
+
+            def cancel_stalled_prepare() -> None:
+                nonlocal timed_out
+                timed_out = True
+                task.cancel()
+
+            deadline = asyncio.get_running_loop().call_later(
+                PREPARE_HANDLER_TIMEOUT_SEC, cancel_stalled_prepare
+            )
+            try:
+                self.state.check_registration(job_id)
+                return await self._prepare(job_id, request)
+            except asyncio.CancelledError as exc:
+                if not timed_out:
+                    raise
+                # Python 3.11+ tracks cancellation requests separately. Remove
+                # only our deadline's request when translating it into an error.
+                uncancel = getattr(task, "uncancel", None)
+                if uncancel is not None:
+                    uncancel()
+                raise RuntimeError(
+                    f"wake registration timed out inside bridge at {self._registration_stage.get()} "
+                    f"after {PREPARE_HANDLER_TIMEOUT_SEC:g} seconds"
+                ) from exc
+            except (AppServerError, TimeoutError) as exc:
+                raise RuntimeError(
+                    f"wake registration failed at {self._registration_stage.get()}: {type(exc).__name__}: {exc}"
+                ) from exc
+            finally:
+                deadline.cancel()
+                self.state.event(job_id, "prepare_finished", {
+                    "stage": self._registration_stage.get(),
+                    "elapsed_sec": round(time.monotonic() - started, 3),
+                    "timed_out": timed_out,
+                })
+                self._registration_stage.reset(stage_token)
         if action == "terminal":
             return await self._terminal(job_id, request)
         if action == "abort":
@@ -160,6 +245,7 @@ class GoalBridge:
                 return {"ok": True, "automatic_wakeup": True, "idempotent": True}
             raise RuntimeError("job already has a non-reusable wake lease")
 
+        self._prepare_stage(job_id, "goal/read-active")
         result = await self.app.call("thread/goal/get", {"threadId": thread_id})
         goal = self._goal_from_result(result)
         if goal.get("status") != "active":
@@ -179,6 +265,7 @@ class GoalBridge:
         )
         self._pause_notifications[thread_id] = []
         try:
+            self._prepare_stage(job_id, "goal/pause")
             paused_result = await self.app.call(
                 "thread/goal/set", {"threadId": thread_id, "status": "paused"}
             )
@@ -189,6 +276,7 @@ class GoalBridge:
             if type(paused_updated_at) is not int or paused_updated_at < updated_at:
                 raise RuntimeError("App Server returned incomplete paused Goal revision")
             # Also catch a manual change whose notification has not arrived.
+            self._prepare_stage(job_id, "goal/confirm-pause")
             latest = self._goal_from_result(await self.app.call("thread/goal/get", {"threadId": thread_id}))
             if (not self._same_goal(lease, latest) or latest.get("status") != "paused"
                     or latest.get("updatedAt") != paused_updated_at):
@@ -265,6 +353,7 @@ class GoalBridge:
 
     async def _abort(self, job_id: str, request: dict[str, Any]) -> dict[str, Any]:
         thread_id = self._thread_id(request.get("thread_id"))
+        self.state.abort_registration(job_id, thread_id)
         lease = self.state.get(job_id)
         if lease is None:
             return {"ok": True, "delivery_state": "not_registered"}

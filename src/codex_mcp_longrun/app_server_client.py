@@ -63,7 +63,7 @@ class AppServerClient:
                     "clientInfo": {
                         "name": "codex_longrun_bridge",
                         "title": "Codex Longrun Goal Bridge",
-                        "version": "0.4.0a12",
+                        "version": "0.4.0a13",
                     },
                     "capabilities": {"experimentalApi": True},
                 },
@@ -107,6 +107,8 @@ class AppServerClient:
             if isinstance(exc, AppServerError):
                 raise
             raise AppServerError(f"Codex App Server request failed: {method}: {exc}") from exc
+        finally:
+            self._pending.pop(request_id, None)
         if "error" in response:
             raise AppServerError(f"{method}: {response['error']}")
         return response.get("result")

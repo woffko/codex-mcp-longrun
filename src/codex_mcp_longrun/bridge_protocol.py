@@ -15,6 +15,11 @@ from typing import Any
 PROTOCOL_VERSION = 1
 MAX_MESSAGE_BYTES = 64 * 1024
 DEFAULT_REQUEST_TIMEOUT_SEC = 5.0
+# Preparing a wake lease can require several independently bounded App Server
+# requests. Keep the bridge-side deadline shorter than the MCP client's deadline
+# so a stalled preparation is cancelled and reported before the caller gives up.
+PREPARE_HANDLER_TIMEOUT_SEC = 45.0
+PREPARE_REQUEST_TIMEOUT_SEC = 50.0
 
 
 class BridgeError(RuntimeError):
@@ -61,7 +66,9 @@ async def request_bridge(
     try:
         response_line = await asyncio.wait_for(exchange(), timeout=timeout_sec)
     except TimeoutError as exc:
-        raise BridgeError("longrun bridge request timed out") from exc
+        action = request.get("action")
+        label = f" {action}" if isinstance(action, str) and action else ""
+        raise BridgeError(f"longrun bridge{label} request timed out after {timeout_sec:g} seconds") from exc
     except OSError as exc:
         raise BridgeError(f"longrun bridge connection failed: {exc}") from exc
 

@@ -31,7 +31,7 @@ from mcp import types as mcp_types
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
-from .bridge_protocol import BridgeError, request_bridge
+from .bridge_protocol import BridgeError, PREPARE_REQUEST_TIMEOUT_SEC, request_bridge
 from .secret_input import (
     DEFAULT_MAX_SECRET_BYTES,
     DEFAULT_SECRET_TTL_SEC,
@@ -44,7 +44,7 @@ from .secret_input import (
 
 
 SERVER_NAME = "Codex MCP Longrun"
-SERVER_VERSION = "0.4.0a12"
+SERVER_VERSION = "0.4.0a13"
 DEFAULT_MAX_LOG_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_TIMEOUT_SEC = 12 * 60 * 60
 DEFAULT_HEARTBEAT_INITIAL_SEC = 0
@@ -738,8 +738,16 @@ async def _prepare_wake_registration(
                 "wake_policy": wake_policy,
                 "call_id": call_id,
             },
+            timeout_sec=PREPARE_REQUEST_TIMEOUT_SEC,
         )
-    except BridgeError as exc:
+        if response.get("automatic_wakeup") is not True:
+            raise RuntimeError("Bridge did not confirm automatic wakeup")
+        mode = response.get("wake_mode", "goal")
+        if mode not in {"session", "goal"} or (
+            wake_policy == "session" and mode != "session" and response.get("state_based_routing") is not True
+        ):
+            raise RuntimeError("Bridge returned an incompatible wake mode")
+    except (BridgeError, RuntimeError, asyncio.CancelledError) as exc:
         # A transport failure can be ambiguous: prepare may have reached the
         # bridge and paused the Goal before the response was lost. Best-effort
         # abort the exact job/thread lease before either failing or falling back.
@@ -754,14 +762,9 @@ async def _prepare_wake_registration(
             )
         except BridgeError:
             pass
-        raise RuntimeError(f"Automatic wakeup setup failed: {exc}") from exc
-    if response.get("automatic_wakeup") is not True:
-        raise RuntimeError("Bridge did not confirm automatic wakeup")
-    mode = response.get("wake_mode", "goal")
-    if mode not in {"session", "goal"} or (
-        wake_policy == "session" and mode != "session" and response.get("state_based_routing") is not True
-    ):
-        raise RuntimeError("Bridge returned an incompatible wake mode")
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        raise RuntimeError(f"Automatic wakeup setup failed for job {job_id}: {exc}") from exc
     return WakeRegistration(socket_path=BRIDGE_SOCKET, thread_id=thread_id, wake_mode=mode), "armed"
 
 
@@ -1737,7 +1740,7 @@ async def start_job(
                 timeout_sec=timeout_sec,
                 grace_period_sec=grace_period_sec,
             )
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             _update_job_metadata(
                 job_id,
                 state="spawn_error",
@@ -1745,7 +1748,7 @@ async def start_job(
                 automatic_wakeup=False,
                 wake_policy=wake_policy,
                 wake_delivery="setup_failed",
-                error=f"Automatic wakeup setup failed before command start: {exc}",
+                error=f"Automatic wakeup setup failed before command start: {type(exc).__name__}: {exc}",
             )
             raise
 

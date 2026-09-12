@@ -9,6 +9,17 @@ with Codex 0.153.4. Ordinary `codex` still has no wake coordinator.
 | `none` | Explicit manual operation; no automatic wakeup |
 
 With a configured bridge, registration errors fail before command startup.
+Version `0.4.0a13` uses a 45-second bridge-side registration deadline and a 50-second MCP-client
+deadline because one registration can require several independently bounded
+Codex App Server checks. The shorter inner deadline cancels a stalled prepare
+and returns a concrete setup error before the client gives up. Session mode
+persists its preparing lease before the TUI checks. Aborts are also recorded
+before any lease exists, so a delayed first Goal snapshot cannot create a lease
+after cancellation. A disconnected preparation is cancelled and cleaned up;
+handoff and terminal delivery retain their independent lifetime. Setup errors
+report the job ID and the failed registration stage. A lost pause reply can
+leave a Goal paused for manual recovery; the bridge never guesses that it may
+override a user pause.
 In this `experimental` branch trial, a paused or blocked (stalled) Goal does not
 prevent an already-authorized task from using session continuation. Its status,
 objective, and usage remain unchanged. Usage-limited and budget-limited Goals

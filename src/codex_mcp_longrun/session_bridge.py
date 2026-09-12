@@ -149,6 +149,7 @@ class SessionBridge(GoalBridge):
         if policy not in {"auto", "goal", "session"}:
             raise ValueError("invalid wake policy")
         thread_id = self._thread_id(request.get("thread_id"))
+        self._prepare_stage(job_id, "routing/read-goal")
         result = await self.app.call("thread/goal/get", {"threadId": thread_id})
         if not isinstance(result, dict) or "goal" not in result:
             raise RuntimeError("cannot establish Goal state")
@@ -176,39 +177,83 @@ class SessionBridge(GoalBridge):
                 await self.call_changed.wait()
             return self.calls[key]
         try:
+            self._prepare_stage(job_id, "session/observe-call")
             turn_id, peer = await asyncio.wait_for(observed(), 2)
         except TimeoutError as exc:
             raise RuntimeError("session handoff requires the matching live codex-longrun TUI connection") from exc
+
+        existing = self.state.get(job_id)
+        if existing is not None:
+            if (existing.thread_id == thread_id and existing.wake_mode == "session"
+                    and existing.state == "armed" and existing.handoff_state == "pending"
+                    and existing.delivery_state == "pending"
+                    and existing.objective == json.dumps(goal, sort_keys=True)
+                    and existing.turn_id == turn_id and existing.call_id == call_id
+                    and self.lease_peers.get(job_id) is peer
+                    and self.peers.get(thread_id) is peer
+                    and thread_id not in self.ambiguous_threads
+                    and self.calls.get(key) == (turn_id, peer)):
+                return {"ok": True, "automatic_wakeup": True, "wake_mode": "session",
+                        "state_based_routing": True, "thread_id": thread_id,
+                        "turn_id": turn_id, "idempotent": True}
+            raise RuntimeError("job already has a non-reusable wake lease")
+        lease = self.state.create_lease(
+            job_id=job_id, thread_id=thread_id,
+            objective=json.dumps(goal, sort_keys=True), goal_created_at=0, goal_updated_at=0,
+            deadline_at=time.time() + timeout + grace + 60,
+            wake_mode="session", turn_id=turn_id, call_id=call_id,
+        )
 
         async def prepare() -> dict[str, Any]:
             if thread_id in self.ambiguous_threads:
                 raise RuntimeError("session handoff requires one unambiguous owning TUI connection")
             if self.calls.get(key) != (turn_id, peer):
                 raise RuntimeError("user activity superseded the originating tool call")
+            self._prepare_stage(job_id, "session/read-current-turn")
             latest = await self._latest_turn(peer, thread_id)
             if latest.get("id") != turn_id or latest.get("status") != "inProgress":
                 raise RuntimeError("originating tool call is no longer in the active turn")
+            self._prepare_stage(job_id, "session/confirm-goal")
             goal_now = await peer.call("thread/goal/get", {"threadId": thread_id})
             if not isinstance(goal_now, dict) or "goal" not in goal_now or goal_now["goal"] != goal:
                 raise RuntimeError("Goal changed before session registration")
-            existing = self.state.get(job_id)
-            if existing is not None and (existing.state != "armed" or existing.handoff_state != "pending"):
-                raise RuntimeError("job already has a non-reusable wake lease")
-            lease = self.state.create_lease(
-                job_id=job_id, thread_id=thread_id,
-                objective=json.dumps(goal, sort_keys=True), goal_created_at=0, goal_updated_at=0,
-                deadline_at=time.time() + timeout + grace + 60,
-                wake_mode="session", turn_id=turn_id, call_id=call_id,
-            )
-            if lease.wake_mode != "session" or lease.turn_id != turn_id or lease.call_id != call_id:
-                raise RuntimeError("job already belongs to a different wake registration")
+            current = self.state.get(job_id)
+            if (current is None or current.state != "preparing" or current.delivery_state != "pending"
+                    or current.wake_mode != "session" or current.turn_id != turn_id
+                    or current.call_id != call_id):
+                raise RuntimeError("session wake registration was revoked before confirmation")
             self.state.update(job_id, state="armed")
             self.lease_peers[job_id] = peer
             self._schedule_deadline(self.state.get(job_id) or lease)
             return {"ok": True, "automatic_wakeup": True, "wake_mode": "session",
                     "state_based_routing": True,
                     "thread_id": thread_id, "turn_id": turn_id}
-        return await peer.exclusive(prepare)
+        try:
+            self._prepare_stage(job_id, "session/wait-for-owner")
+            return await peer.exclusive(prepare)
+        except (Exception, asyncio.CancelledError) as exc:
+            current = self.state.get(job_id)
+            if current is not None and current.state == "preparing":
+                self.state.update(job_id, state="abandoned", delivery_state="abandoned",
+                                  error=f"session prepare failed: {type(exc).__name__}: {exc}")
+            self.lease_peers.pop(job_id, None)
+            raise
+
+    async def _abort(self, job_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        lease = self.state.get(job_id)
+        if lease is None or lease.wake_mode != "session":
+            return await super()._abort(job_id, request)
+        thread_id = self._thread_id(request.get("thread_id"))
+        self.state.abort_registration(job_id, thread_id)
+        if lease.thread_id != thread_id:
+            raise RuntimeError("wake lease belongs to another thread")
+        if lease.delivery_state in {"resumed", "abandoned", "needs_manual_recovery"}:
+            return {"ok": True, "delivery_state": lease.delivery_state}
+        self._abandon_for_manual_change(
+            thread_id, "Session wake registration aborted before command start"
+        )
+        self.lease_peers.pop(job_id, None)
+        return {"ok": True, "delivery_state": "abandoned"}
 
     def _live_session(self, job_id: str) -> WakeLease:
         lease = self.state.get(job_id)

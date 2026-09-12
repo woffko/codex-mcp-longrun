@@ -16,8 +16,8 @@ process group, captures bounded output, and persists terminal metadata.
 Codex calls longrun.start_job once through codex-longrun
                   |
                   v
-The local MCP server starts the command;
-the coordinator prepares Goal or session continuation
+The coordinator prepares Goal or session continuation;
+the local MCP server then starts the command
                   |
                   v
 Goal: Codex ends the turn. Session: the coordinator interrupts it.
@@ -31,7 +31,7 @@ The project is currently a Linux/WSL pilot, not a production release.
 
 > [!IMPORTANT]
 > This README describes the `experimental` branch and package version
-> `0.4.0a12`. This experimental version selects continuation from the Goal state:
+> `0.4.0a13`. This experimental version selects continuation from the Goal state:
 > an active Goal uses Goal wakeup; paused, blocked, completed, or absent Goals
 > use session wakeup without changing the Goal. Prefer `wake_policy="auto"`.
 > `goal` and `session` are also routed by state in this experiment. The manual Goal and blocking workflows are
@@ -39,12 +39,20 @@ The project is currently a Linux/WSL pilot, not a production release.
 
 ## Why use it
 
-The `0.4.0a12` experiment removes the extra outside-Goal approval step for an
+The `0.4.0a13` experiment removes the extra outside-Goal approval step for an
 already requested task when the existing Goal is paused or blocked. Check
 `health.state_based_routing=true` to identify this coordinator behavior.
 Usage/budget limits remain protected, and `wake_policy="none"` remains manual.
 Routing is selected once per new job; a later user/Goal change can still revoke
 its pending wake. The stable `main` branch retains its previous routing policy.
+
+Wake registration now has coordinated client and bridge deadlines long enough
+for its bounded Codex App Server checks. The bridge cancels a stalled prepare
+before the MCP client deadline, cancels preparation when its client disconnects,
+and remembers aborts even before a lease exists. Session mode persists a preparing
+lease before its TUI checks. A registration failure remains a pre-command failure
+and reports the job ID and failed stage, such as `routing/read-goal` or
+`session/read-current-turn`. No device command is retried automatically.
 
 Version `0.4.0a11` fixes a Goal pause-notification race that could discard the
 normal completion event and defer wakeup until the job's safety deadline.

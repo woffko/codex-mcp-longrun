@@ -66,6 +66,10 @@ class BridgeState:
                 details_json TEXT NOT NULL,
                 created_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS registration_aborts (
+                job_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL
+            );
             """
         )
         self._db.commit()
@@ -102,6 +106,7 @@ class BridgeState:
         now = time.time()
         try:
             with self._db:
+                self.check_registration(job_id)
                 self._db.execute(
                     """
                     INSERT INTO wake_leases (
@@ -137,6 +142,27 @@ class BridgeState:
         lease = self.get(job_id)
         assert lease is not None
         return lease
+
+    def check_registration(self, job_id: str) -> None:
+        if self._db.execute(
+            "SELECT 1 FROM registration_aborts WHERE job_id = ?", (job_id,)
+        ).fetchone() is not None:
+            raise RuntimeError("wake registration was revoked before confirmation")
+
+    def abort_registration(self, job_id: str, thread_id: str) -> None:
+        """Remember aborts even when prepare is still reading its first snapshot."""
+        lease = self.get(job_id)
+        if lease is not None and lease.thread_id != thread_id:
+            raise RuntimeError("wake lease belongs to another thread")
+        with self._db:
+            row = self._db.execute(
+                "SELECT thread_id FROM registration_aborts WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is not None and row[0] != thread_id:
+                raise RuntimeError("wake registration abort belongs to another thread")
+            self._db.execute(
+                "INSERT OR IGNORE INTO registration_aborts VALUES (?, ?)", (job_id, thread_id)
+            )
 
     def update(self, job_id: str, **fields: Any) -> WakeLease:
         allowed = {"state", "terminal_state", "delivery_state", "error", "goal_updated_at",

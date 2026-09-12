@@ -8,6 +8,7 @@ import unittest
 import uuid
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from websockets.asyncio.server import ServerConnection, unix_serve
 
@@ -420,7 +421,7 @@ class GoalPauseOrderingTests(unittest.IsolatedAsyncioTestCase):
             await self.notify(goal)
             raise TimeoutError("synthetic lost pause reply")
         self.before_pause_reply(lost_reply)
-        with self.assertRaises(TimeoutError):
+        with self.assertRaisesRegex(RuntimeError, "goal/pause.*synthetic lost pause reply"):
             await self.bridge._dispatch(self.request)
         self.assert_not_rearmed()
 
@@ -436,6 +437,54 @@ class GoalPauseOrderingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await task
         self.assert_not_rearmed()
+
+    async def test_internal_prepare_deadline_cancels_and_revokes_registration(self) -> None:
+        entered = asyncio.Event()
+
+        async def pending_reply(goal):
+            entered.set()
+            await asyncio.Future()
+
+        self.before_pause_reply(pending_reply)
+        with patch("codex_mcp_longrun.bridge.PREPARE_HANDLER_TIMEOUT_SEC", 0.01):
+            with self.assertRaisesRegex(RuntimeError, "timed out inside bridge"):
+                await self.bridge._dispatch(self.request)
+        self.assertTrue(entered.is_set())
+        self.assert_not_rearmed()
+
+    async def test_prepare_is_cancelled_when_client_disconnects(self) -> None:
+        entered = asyncio.Event()
+
+        async def pending_reply(goal):
+            entered.set()
+            await asyncio.Future()
+
+        self.before_pause_reply(pending_reply)
+        socket_path = Path(self.tempdir.name) / "disconnect.sock"
+        try:
+            server = await asyncio.start_unix_server(
+                self.bridge._handle_connection, path=str(socket_path)
+            )
+        except PermissionError as exc:
+            self.skipTest(f"sandbox does not permit Unix sockets: {exc}")
+        try:
+            _, writer = await asyncio.open_unix_connection(str(socket_path))
+            writer.write(json.dumps(self.request).encode("utf-8") + b"\n")
+            await writer.drain()
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            writer.close()
+            await writer.wait_closed()
+            for _ in range(100):
+                lease = self.bridge.state.get(self.job_id)
+                if lease is not None and lease.state == "abandoned":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("disconnected prepare was not cancelled")
+            self.assert_not_rearmed()
+        finally:
+            server.close()
+            await server.wait_closed()
 
     async def test_duplicate_prepare_cannot_claim_success_before_confirmation(self) -> None:
         entered, release = asyncio.Event(), asyncio.Event()
