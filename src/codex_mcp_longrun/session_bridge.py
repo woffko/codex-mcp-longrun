@@ -32,6 +32,9 @@ class SessionBridge(GoalBridge):
         self.lease_peers: dict[str, SessionPeer] = {}
         self.ambiguous_threads: set[str] = set()
         self.calls: OrderedDict[tuple[str, str], tuple[str, SessionPeer]] = OrderedDict()
+        # Only live notifications on the exact owning connection are authority.
+        # A paginated legacy-history request may still scan gigabytes on disk.
+        self.observed_turns: dict[str, tuple[SessionPeer, str, str]] = {}
         self.call_changed = asyncio.Event()
         self.turn_done: dict[tuple[str, str], asyncio.Event] = {}
 
@@ -43,6 +46,7 @@ class SessionBridge(GoalBridge):
         if request.get("action") == "health":
             return {"ok": True, "version": PROTOCOL_VERSION,
                     "session_wakeup_supported": True,
+                    "session_history_free": True,
                     "state_based_routing": True,
                     "session_transport_ready": bool(self.peers)}
         if request.get("action") in {"handoff", "cancel_wakeup", "wake_status"}:
@@ -69,7 +73,7 @@ class SessionBridge(GoalBridge):
         thread_id = params.get("threadId")
         if not isinstance(thread_id, str):
             return
-        if method in {"item/started", "turn/started"}:
+        if method in {"item/started", "turn/started", "turn/completed"}:
             owner = self.peers.get(thread_id)
             if owner is not None and owner is not peer:
                 # Multiple subscribed TUI clients receive the same tool events.
@@ -82,22 +86,53 @@ class SessionBridge(GoalBridge):
             if (isinstance(item, dict) and item.get("type") == "mcpToolCall"
                     and item.get("server") == "longrun" and item.get("tool") == "start_job"
                     and isinstance(item.get("id"), str) and isinstance(params.get("turnId"), str)):
+                turn_id = params["turnId"]
+                if not turn_id or len(turn_id) > 256:
+                    return
+                observed_turn = self.observed_turns.get(thread_id)
+                if observed_turn is None:
+                    # A TUI resumed during a live turn need not have seen its
+                    # turn/started notification. Its new live MCP item is a
+                    # sufficient seed; persisted/replayed history never is.
+                    self.observed_turns[thread_id] = (peer, turn_id, "inProgress")
+                elif observed_turn != (peer, turn_id, "inProgress"):
+                    # Do not revive a completed turn or adopt a stale item
+                    # belonging to a previously observed turn.
+                    return
                 self.calls[(thread_id, item["id"])] = (params["turnId"], peer)
                 self.peers[thread_id] = peer
                 while len(self.calls) > 256:
                     self.calls.popitem(last=False)
                 self.call_changed.set()
         if method == "turn/started":
+            turn = params.get("turn")
+            turn_id = turn.get("id") if isinstance(turn, dict) else None
+            if not isinstance(turn_id, str) or not 1 <= len(turn_id) <= 256:
+                self.user_activity(thread_id)
+                return
+            previous = self.observed_turns.get(thread_id)
+            if previous is not None and previous[1] == turn_id and previous[2] != "inProgress":
+                return  # An out-of-order duplicate cannot reopen a terminal turn.
             self.peers[thread_id] = peer
-            turn_id = params.get("turn", {}).get("id")
+            self.observed_turns[thread_id] = (peer, turn_id, "inProgress")
             lease = self.state.live_for_thread(thread_id)
             if (lease and lease.wake_mode == "session" and turn_id != lease.turn_id
                     and lease.delivery_state != "activating"):
                 self._abandon_for_manual_change(thread_id, "Another turn started before wake delivery")
         if method == "turn/completed":
-            turn = params.get("turn", {})
-            turn_id = turn.get("id")
+            turn = params.get("turn")
+            turn_id = turn.get("id") if isinstance(turn, dict) else None
             if isinstance(turn_id, str):
+                previous = self.observed_turns.get(thread_id)
+                if previous is not None and previous[1] != turn_id:
+                    return  # Completion of an older turn cannot release this handoff.
+                if previous is not None and previous[2] != "inProgress":
+                    return  # Terminal state is immutable, including duplicate events.
+                status = turn.get("status")
+                if status not in {"completed", "interrupted", "failed"}:
+                    status = "unknown"
+                self.peers[thread_id] = peer
+                self.observed_turns[thread_id] = (peer, turn_id, status)
                 event = self.turn_done.get((thread_id, turn_id))
                 if event is not None:
                     event.set()
@@ -124,6 +159,7 @@ class SessionBridge(GoalBridge):
             if owner is peer:
                 self.user_activity(thread_id)
                 del self.peers[thread_id]
+                self.observed_turns.pop(thread_id, None)
                 self.ambiguous_threads.discard(thread_id)
         for job_id, owner in list(self.lease_peers.items()):
             if owner is peer:
@@ -136,13 +172,14 @@ class SessionBridge(GoalBridge):
                 del self.calls[key]
 
     async def _latest_turn(self, peer: SessionPeer, thread_id: str) -> dict[str, Any]:
-        result = await peer.call("thread/turns/list", {
-            "threadId": thread_id, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded",
-        })
-        turns = result.get("data") if isinstance(result, dict) else None
-        if not isinstance(turns, list) or len(turns) != 1 or not isinstance(turns[0], dict):
-            raise RuntimeError("cannot confirm the current turn through bounded history")
-        return turns[0]
+        # Keep the await-compatible helper for the three guarded call sites,
+        # but never query or reconstruct persisted history here.
+        observed = self.observed_turns.get(thread_id)
+        if (observed is None or observed[0] is not peer
+                or self.peers.get(thread_id) is not peer
+                or thread_id in self.ambiguous_threads):
+            raise RuntimeError("cannot confirm the current turn from its owning live event stream")
+        return {"id": observed[1], "status": observed[2]}
 
     async def _prepare(self, job_id: str, request: dict[str, Any]) -> dict[str, Any]:
         policy = request.get("wake_policy", "goal")
@@ -209,7 +246,7 @@ class SessionBridge(GoalBridge):
                 raise RuntimeError("session handoff requires one unambiguous owning TUI connection")
             if self.calls.get(key) != (turn_id, peer):
                 raise RuntimeError("user activity superseded the originating tool call")
-            self._prepare_stage(job_id, "session/read-current-turn")
+            self._prepare_stage(job_id, "session/check-live-turn")
             latest = await self._latest_turn(peer, thread_id)
             if latest.get("id") != turn_id or latest.get("status") != "inProgress":
                 raise RuntimeError("originating tool call is no longer in the active turn")
@@ -217,6 +254,9 @@ class SessionBridge(GoalBridge):
             goal_now = await peer.call("thread/goal/get", {"threadId": thread_id})
             if not isinstance(goal_now, dict) or "goal" not in goal_now or goal_now["goal"] != goal:
                 raise RuntimeError("Goal changed before session registration")
+            latest = await self._latest_turn(peer, thread_id)
+            if latest.get("id") != turn_id or latest.get("status") != "inProgress":
+                raise RuntimeError("originating turn changed during session registration")
             current = self.state.get(job_id)
             if (current is None or current.state != "preparing" or current.delivery_state != "pending"
                     or current.wake_mode != "session" or current.turn_id != turn_id

@@ -61,12 +61,16 @@ class RegistrationTests(unittest.IsolatedAsyncioTestCase):
             self.skipTest(f"sandbox does not permit Unix sockets: {exc}")
         self.bridge.bridge_socket.chmod(0o600)
 
-    def block(self, method):
+    def block(self, method, *, occurrence=1):
         entered, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
         original = self.bridge.app.call
+        matches = 0
 
         async def call(name, params):
+            nonlocal matches
             if name == method:
+                matches += 1
+            if name == method and matches == occurrence:
                 entered.set()
                 try:
                     await release.wait()
@@ -106,9 +110,13 @@ class RegistrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_delayed_prepare_longer_than_old_client_deadline_succeeds(self):
         await self.listen()
         original = self.peer.call
+        goal_reads = 0
 
         async def call(method, params):
-            if method == "thread/turns/list":
+            nonlocal goal_reads
+            if method == "thread/goal/get":
+                goal_reads += 1
+            if method == "thread/goal/get" and goal_reads == 2:
                 await asyncio.sleep(5.2)
             return await original(method, params)
 
@@ -134,7 +142,7 @@ class RegistrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_socket_disconnect_cancels_session_prepare_and_revokes_lease(self):
         await self.listen()
-        entered, release, cancelled = self.block("thread/turns/list")
+        entered, release, cancelled = self.block("thread/goal/get", occurrence=2)
         _, writer = await asyncio.open_unix_connection(str(self.bridge.bridge_socket))
         try:
             writer.write(json.dumps(self.request).encode() + b"\n")
@@ -150,7 +158,7 @@ class RegistrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_handler_cancellation_waits_for_prepare_cleanup(self):
         await self.listen()
-        entered, _, cancelled = self.block("thread/turns/list")
+        entered, _, cancelled = self.block("thread/goal/get", occurrence=2)
         client = asyncio.create_task(request_bridge(self.bridge.bridge_socket, self.request))
         self.tasks.append(client)
         await asyncio.wait_for(entered.wait(), 1)
@@ -163,7 +171,7 @@ class RegistrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_extra_request_bytes_are_rejected_and_revoke_preparation(self):
         await self.listen()
-        entered, _, cancelled = self.block("thread/turns/list")
+        entered, _, cancelled = self.block("thread/goal/get", occurrence=2)
         reader, writer = await asyncio.open_unix_connection(str(self.bridge.bridge_socket))
         try:
             writer.write(json.dumps(self.request).encode() + b"\n")
@@ -182,7 +190,7 @@ class RegistrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancelled_submission_releases_reserved_job_without_command_start(self):
         await self.listen()
-        entered, _, _ = self.block("thread/turns/list")
+        entered, _, _ = self.block("thread/goal/get", occurrence=2)
         with patch.object(server, "BRIDGE_SOCKET", str(self.bridge.bridge_socket)), \
                 patch.object(server, "_run_background_job", new_callable=AsyncMock) as run, \
                 patch.object(server.uuid, "uuid4", return_value=SimpleNamespace(hex=self.job)):
@@ -200,12 +208,12 @@ class RegistrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_deadline_reports_stage_and_never_starts_command(self):
         await self.listen()
-        _, release, cancelled = self.block("thread/turns/list")
+        _, release, cancelled = self.block("thread/goal/get", occurrence=2)
         with patch("codex_mcp_longrun.bridge.PREPARE_HANDLER_TIMEOUT_SEC", 0.05), \
                 patch.object(server, "BRIDGE_SOCKET", str(self.bridge.bridge_socket)), \
                 patch.object(server, "_run_background_job", new_callable=AsyncMock) as run, \
                 patch.object(server.uuid, "uuid4", return_value=SimpleNamespace(hex=self.job)):
-            with self.assertRaisesRegex(RuntimeError, "session/read-current-turn"):
+            with self.assertRaisesRegex(RuntimeError, "session/confirm-goal"):
                 await server.start_job(argv=["/usr/bin/true"], cwd=str(TEST_ROOT),
                                        ctx=self.context, wake_policy="auto", timeout_sec=5)
             run.assert_not_called()
@@ -215,23 +223,27 @@ class RegistrationTests(unittest.IsolatedAsyncioTestCase):
         metadata = server._read_job_metadata(self.job)
         self.assertEqual(metadata["state"], "spawn_error")
         self.assertIn("before command start", metadata["error"])
-        self.assertIn("session/read-current-turn", metadata["error"])
+        self.assertIn("session/confirm-goal", metadata["error"])
 
     async def test_inner_rpc_failure_reports_stage(self):
         original = self.peer.call
+        goal_reads = 0
 
         async def call(method, params):
-            if method == "thread/turns/list":
+            nonlocal goal_reads
+            if method == "thread/goal/get":
+                goal_reads += 1
+            if method == "thread/goal/get" and goal_reads == 2:
                 raise TimeoutError("fixture reply missing")
             return await original(method, params)
 
         self.peer.call = call
-        with self.assertRaisesRegex(RuntimeError, "session/read-current-turn.*fixture reply missing"):
+        with self.assertRaisesRegex(RuntimeError, "session/confirm-goal.*fixture reply missing"):
             await self.bridge._dispatch(self.request)
         self.assertEqual(self.bridge.state.get(self.job).state, "abandoned")
 
     async def test_duplicate_session_prepare_cannot_succeed_while_first_is_pending(self):
-        entered, release, _ = self.block("thread/turns/list")
+        entered, release, _ = self.block("thread/goal/get", occurrence=2)
         task = asyncio.create_task(self.bridge._dispatch(self.request))
         self.tasks.append(task)
         await asyncio.wait_for(entered.wait(), 1)

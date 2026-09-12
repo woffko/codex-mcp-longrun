@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import closing
 import json
 from pathlib import Path
 import tempfile
@@ -33,9 +34,8 @@ class Peer:
         self.calls.append((method, params))
         if method == "thread/goal/get":
             return {"goal": self.goal}
-        if method == "thread/turns/list":
-            assert params["limit"] == 1 and params["itemsView"] == "notLoaded"
-            return {"data": [dict(self.turn)]}
+        if method in {"thread/turns/list", "thread/items/list", "thread/read"}:
+            raise AssertionError("session continuation must not inspect persisted history")
         if self.fail == method:
             raise TimeoutError("ambiguous test RPC")
         if method == "turn/interrupt":
@@ -82,7 +82,10 @@ class SessionBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.bridge.state.close()
         self.tmp.cleanup()
 
-    async def observed(self):
+    async def observed(self, *, emit_started=True):
+        if emit_started:
+            await self.bridge.observe(self.peer, "turn/started", {
+                "threadId": self.thread, "turn": dict(self.peer.turn)})
         await self.bridge.observe(self.peer, "item/started", {
             "threadId": self.thread, "turnId": self.peer.turn["id"],
             "item": {"type": "mcpToolCall", "server": "longrun", "tool": "start_job", "id": "mcp-call"}})
@@ -271,9 +274,13 @@ class SessionBridgeTests(unittest.IsolatedAsyncioTestCase):
         entered = asyncio.Event()
         release = asyncio.Event()
         original_call = self.peer.call
+        goal_reads = 0
 
         async def delayed_call(method, params):
-            if method == "thread/turns/list":
+            nonlocal goal_reads
+            if method == "thread/goal/get":
+                goal_reads += 1
+            if method == "thread/goal/get" and goal_reads == 2:
                 entered.set()
                 await release.wait()
             return await original_call(method, params)
@@ -300,6 +307,130 @@ class SessionBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bridge.state.get(self.job).state, "abandoned")
         self.assertNotIn(self.job, self.bridge._delivery_tasks)
         self.assertEqual(json.dumps(self.peer.goal, sort_keys=True), original)
+
+    async def test_resumed_live_mcp_item_seeds_turn_without_history_or_started_event(self):
+        await self.observed(emit_started=False)
+        await self.bridge._dispatch(self.request)
+        await self.handoff()
+        await self.terminal()
+        await self.delivery()
+        self.assertEqual(self.peer.wakes, 1)
+        self.assertFalse(any(m in {"thread/turns/list", "thread/items/list", "thread/read"}
+                             for m, _ in self.peer.calls))
+
+    async def test_health_advertises_history_free_session_tracking_without_rpc(self):
+        result = await self.bridge._dispatch({"version": 1, "action": "health"})
+        self.assertTrue(result["session_history_free"])
+        self.assertEqual(self.peer.calls, [])
+
+    async def test_duplicate_completion_during_receipt_does_not_abandon_handoff(self):
+        await self.prepare()
+        original = self.peer.call
+        async def call(method, params):
+            if method == "thread/inject_items":
+                await self.bridge.observe(self.peer, "turn/completed", {
+                    "threadId": self.thread, "turn": dict(self.peer.turn)})
+            return await original(method, params)
+        self.peer.call = call
+        await self.handoff()
+        await self.terminal()
+        await self.delivery()
+        self.assertEqual(self.peer.wakes, 1)
+
+    async def test_terminal_status_cannot_be_rewritten_by_a_conflicting_event(self):
+        await self.observed()
+        for status in ("completed", "interrupted"):
+            await self.bridge.observe(self.peer, "turn/completed", {
+                "threadId": self.thread, "turn": {**self.peer.turn, "status": status}})
+        self.assertEqual((await self.bridge._latest_turn(self.peer, self.thread))["status"], "completed")
+
+    async def test_summary_or_unknown_stream_is_not_current_turn_authority(self):
+        with self.assertRaisesRegex(RuntimeError, "owning live event"):
+            await self.bridge._latest_turn(self.peer, self.thread)
+        self.assertEqual(self.peer.calls, [])
+
+    async def test_late_item_and_duplicate_started_do_not_revive_completed_turn(self):
+        await self.observed()
+        self.peer.turn["status"] = "completed"
+        await self.bridge.observe(self.peer, "turn/completed", {
+            "threadId": self.thread, "turn": dict(self.peer.turn)})
+        await self.bridge.observe(self.peer, "turn/started", {
+            "threadId": self.thread, "turn": {**self.peer.turn, "status": "inProgress"}})
+        await self.observed(emit_started=False)
+        self.assertNotIn((self.thread, "mcp-call"), self.bridge.calls)
+        self.assertEqual((await self.bridge._latest_turn(self.peer, self.thread))["status"], "completed")
+
+    async def test_stale_item_cannot_replace_a_newer_live_turn(self):
+        await self.observed()
+        old = self.peer.turn["id"]
+        self.peer.turn = {"id": str(uuid.uuid4()), "status": "inProgress"}
+        await self.observed()
+        await self.bridge.observe(self.peer, "item/started", {
+            "threadId": self.thread, "turnId": old,
+            "item": {"type": "mcpToolCall", "server": "longrun", "tool": "start_job", "id": "mcp-call"}})
+        self.assertEqual(self.bridge.calls[(self.thread, "mcp-call")][0], self.peer.turn["id"])
+
+    async def test_foreign_completion_cannot_confirm_owning_handoff(self):
+        await self.prepare()
+        other = Peer(self.bridge, self.thread)
+        await self.bridge.observe(other, "turn/completed", {
+            "threadId": self.thread, "turn": {**self.peer.turn, "status": "interrupted"}})
+        self.assertEqual(self.bridge.state.get(self.job).state, "abandoned")
+        with self.assertRaisesRegex(RuntimeError, "no longer live"):
+            await self.handoff()
+        self.assertEqual(other.calls, [])
+
+    async def test_wrong_turn_completion_does_not_release_interruption_wait(self):
+        await self.prepare()
+        original = self.peer.call
+        async def call(method, params):
+            if method == "turn/interrupt":
+                await self.bridge.observe(self.peer, "turn/completed", {
+                    "threadId": self.thread, "turn": {"id": str(uuid.uuid4()), "status": "interrupted"}})
+                self.assertFalse(self.bridge.turn_done[(self.thread, self.peer.turn["id"])].is_set())
+                self.assertEqual((await self.bridge._latest_turn(self.peer, self.thread))["status"], "inProgress")
+            return await original(method, params)
+        self.peer.call = call
+        await self.handoff()
+        await self.terminal()
+        await self.delivery()
+        self.assertEqual(self.peer.wakes, 1)
+
+    async def test_new_turn_or_activity_during_goal_confirmation_cannot_arm_late(self):
+        for change in ("new-turn", "user-activity", "disconnect"):
+            with self.subTest(change=change):
+                self.request["job_id"] = self.job = uuid.uuid4().hex
+                self.peer = Peer(self.bridge, self.thread)
+                self.bridge.disconnected(self.bridge.peers.get(self.thread))
+                self.bridge.app = self.peer
+                await self.observed()
+                original = self.peer.call
+                entered, release = asyncio.Event(), asyncio.Event()
+                goal_reads = 0
+                async def call(method, params):
+                    nonlocal goal_reads
+                    if method == "thread/goal/get":
+                        goal_reads += 1
+                        if goal_reads == 2:
+                            entered.set()
+                            await release.wait()
+                    return await original(method, params)
+                self.peer.call = call
+                task = asyncio.create_task(self.bridge._dispatch(self.request))
+                await asyncio.wait_for(entered.wait(), 1)
+                if change == "new-turn":
+                    self.peer.turn = {"id": str(uuid.uuid4()), "status": "inProgress"}
+                    await self.bridge.observe(self.peer, "turn/started", {
+                        "threadId": self.thread, "turn": dict(self.peer.turn)})
+                elif change == "user-activity":
+                    self.bridge.user_activity(self.thread)
+                else:
+                    self.bridge.disconnected(self.peer)
+                release.set()
+                with self.assertRaises(RuntimeError):
+                    await task
+                self.assertEqual(self.bridge.state.get(self.job).state, "abandoned")
+                self.assertNotIn(self.job, self.bridge.lease_peers)
 
 
 class GoalCompatibilityTests(goal_tests.BridgeTests):
@@ -332,7 +463,7 @@ class StateUpgradeTests(unittest.TestCase):
     def test_old_goal_identity_and_pause_revision_survive_additive_migration(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "old.db"
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 db.execute("""CREATE TABLE wake_leases (
                     job_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, objective TEXT NOT NULL,
                     goal_created_at INTEGER NOT NULL, goal_updated_at INTEGER NOT NULL,

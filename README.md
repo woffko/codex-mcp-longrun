@@ -31,7 +31,7 @@ The project is currently a Linux/WSL pilot, not a production release.
 
 > [!IMPORTANT]
 > This README describes the `experimental` branch and package version
-> `0.4.0a13`. This experimental version selects continuation from the Goal state:
+> `0.4.0a14`. This experimental version selects continuation from the Goal state:
 > an active Goal uses Goal wakeup; paused, blocked, completed, or absent Goals
 > use session wakeup without changing the Goal. Prefer `wake_policy="auto"`.
 > `goal` and `session` are also routed by state in this experiment. The manual Goal and blocking workflows are
@@ -39,7 +39,7 @@ The project is currently a Linux/WSL pilot, not a production release.
 
 ## Why use it
 
-The `0.4.0a13` experiment removes the extra outside-Goal approval step for an
+The `0.4.0a14` experiment removes the extra outside-Goal approval step for an
 already requested task when the existing Goal is paused or blocked. Check
 `health.state_based_routing=true` to identify this coordinator behavior.
 Usage/budget limits remain protected, and `wake_policy="none"` remains manual.
@@ -52,7 +52,16 @@ before the MCP client deadline, cancels preparation when its client disconnects,
 and remembers aborts even before a lease exists. Session mode persists a preparing
 lease before its TUI checks. A registration failure remains a pre-command failure
 and reports the job ID and failed stage, such as `routing/read-goal` or
-`session/read-current-turn`. No device command is retried automatically.
+`session/confirm-goal`. No device command is retried automatically.
+
+Version `0.4.0a14` validates the originating turn from trusted live TUI events,
+not `thread/turns/list`. A small history page can still require scanning a
+multi-gigabyte Legacy rollout; it must not be on the job registration, handoff,
+or wake-delivery path. `health.session_history_free=true` identifies the fixed
+coordinator. Exact peer/turn/call identity, immutable terminal state, user
+activity, interruption confirmation and once-only wake delivery remain guarded.
+Restart the launcher after upgrading: already-running coordinators retain
+their loaded code. No history deletion or Goal reactivation is required.
 
 Version `0.4.0a11` fixes a Goal pause-notification race that could discard the
 normal completion event and defer wakeup until the job's safety deadline.
@@ -649,7 +658,7 @@ Create the development environment and run the integration suite:
 
 ```bash
 uv sync --frozen --no-dev
-.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m unittest discover -s tests -t . -v
 ```
 
 The suite covers the STDIO handshake, asynchronous submission and later

@@ -9,6 +9,13 @@ with Codex 0.153.4. Ordinary `codex` still has no wake coordinator.
 | `none` | Explicit manual operation; no automatic wakeup |
 
 With a configured bridge, registration errors fail before command startup.
+Version `0.4.0a14` confirms the live originating turn from the owning TUI's
+trusted `turn/started`, `item/started`, and `turn/completed` notifications.
+A new live Longrun MCP item can seed a resumed turn when its earlier start
+notification was not observed. Stale items cannot revive terminal turns or
+replace a newer observed turn. Registration, handoff and delivery do not call
+history APIs, so their cost does not grow with a Legacy rollout's size.
+`health.session_history_free=true` advertises this fixed coordinator.
 Version `0.4.0a13` uses a 45-second bridge-side registration deadline and a 50-second MCP-client
 deadline because one registration can require several independently bounded
 Codex App Server checks. The shorter inner deadline cancels a stalled prepare
@@ -43,8 +50,8 @@ reactivated merely to enable a separate session task.
 3. Longrun starts the supervised background job and keeps the MCP request
    pending. A separately owned handoff task survives cancellation of that RPC.
 4. Through the owning TUI connection, the coordinator interrupts the exact
-   originating turn and confirms both the completion event and its persisted
-   `interrupted` state. It then injects a truthful startup receipt into the
+   originating turn and confirms its exact authoritative `turn/completed`
+   event with `interrupted` status. It then injects a truthful startup receipt into the
    model-visible thread history. No extra generation is needed for the receipt.
 5. Terminal job metadata triggers one completion turn through that same TUI
    connection. The model reads `get_job` once and continues the original task.
@@ -71,7 +78,8 @@ User control and internal wake requests are serialized on the owning proxy
 connection. Multiple subscribed TUI clients make ownership ambiguous, so
 automatic session handoff is rejected rather than moving approvals to another
 client. Direct App Server clients outside the launcher are outside this control
-boundary; the coordinator still rechecks the latest turn and Goal before wakeup.
+boundary; the coordinator still rechecks observed live turn identity and Goal
+before wakeup. It never reconstructs ownership from persisted history.
 
 The handoff has a bounded timeout. Failed or ambiguous interrupt, receipt, and
 turn-start operations require manual recovery; non-idempotent starts are not
@@ -86,8 +94,8 @@ when the coordinator exits; persistent job metadata remains available for manual
 inspection. Automatic survival of a fully closed Codex process is not provided.
 Goal lease recovery retains its previous behavior.
 
-`health` reports `bridge_reachable`, `session_wakeup_supported`, and
-`session_transport_ready`. `get_job` adds `wake_mode`, `handoff_state`,
+`health` reports `bridge_reachable`, `session_wakeup_supported`,
+`session_transport_ready`, and `session_history_free`. `get_job` adds `wake_mode`, `handoff_state`,
 `wake_delivery`, and `wake_error`, while keeping the job result available when
 the coordinator is offline. Receipts contain only job identity and state, never
 command output or secret stdin data.
@@ -111,7 +119,9 @@ does not require separate permission to run a task the user already requested.
 
 Unit tests cover early terminal events, receipt/interrupt failure, ambiguous
 successful wake replies, user cancellation, ownership changes, Goal protection,
-and the existing Goal bridge lifecycle. The opt-in runtime probe uses the real
+the existing Goal bridge lifecycle, forbidden history RPCs, resumed live items,
+stale/duplicate/conflicting completion events, and activity during Goal checks.
+The opt-in runtime probe uses the real
 installed Codex, coordinator, proxy, and Longrun with a loopback deterministic
 model; it needs no API key or external model service:
 

@@ -44,7 +44,7 @@ from .secret_input import (
 
 
 SERVER_NAME = "Codex MCP Longrun"
-SERVER_VERSION = "0.4.0a13"
+SERVER_VERSION = "0.4.0a14"
 DEFAULT_MAX_LOG_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_TIMEOUT_SEC = 12 * 60 * 60
 DEFAULT_HEARTBEAT_INITIAL_SEC = 0
@@ -399,6 +399,7 @@ class HealthResult(BaseModel):
     bridge_reachable: bool = False
     session_wakeup_supported: bool = False
     session_transport_ready: bool = False
+    session_history_free: bool = False
     state_based_routing: bool = False
     secret_stdin_supported: bool
     secret_stdin_pair_supported: bool
@@ -1258,6 +1259,7 @@ async def health() -> HealthResult:
         bridge_reachable=bridge_health.get("ok") is True,
         session_wakeup_supported=bridge_health.get("session_wakeup_supported") is True,
         session_transport_ready=bridge_health.get("session_transport_ready") is True,
+        session_history_free=bridge_health.get("session_history_free") is True,
         state_based_routing=bridge_health.get("state_based_routing") is True,
         secret_stdin_supported=True,
         secret_stdin_pair_supported=hasattr(os, "memfd_create"),
